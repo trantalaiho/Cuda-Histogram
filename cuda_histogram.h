@@ -2317,7 +2317,7 @@ void callSmallBinHisto(
     // TODO: Magic constants..
     // With low bin-counts and large problems it seems beneficial to use
     // more blocks...
-    if (nOut <= 128 || size > 2*4096*4096)
+    if (nOut <= 128 || size > 2*4096*4096 || getTmpBufSize)
         maxblocks *= 2;
     //printf("maxblocks = %d\n", maxblocks);
 

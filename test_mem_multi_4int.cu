@@ -24,15 +24,18 @@
  *
  */
 
-#define TESTMAXIDX   512      // 16 keys / indices
+#define TESTMAXIDX   16384     // 16 keys / indices
 #define TEST_IS_POW2 1
-#define TEST_SIZE (25 * 100 * 1000 )   // 25 million inputs
+#define TEST_SIZE (25 * 1000 * 1000 )   // 25 million inputs
 #define NRUNS 100          // Repeat 100 times => 10 Gigainputs in total (4 inputs per entry)
 #define START_INDEX	0
 #define NSTRESS_RUNS    NRUNS
 
-#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
+#define ENABLE_THRUST   0
+#endif
 
 #include "cuda_histogram.h"
 /*#include <cuda_runtime_api.h>
@@ -334,10 +337,10 @@ static void fillInput(int* input, bool load, bool rnd)
   }
   for (i = 0; i < TEST_SIZE * 4;)
   {
-    *input++ = getInput(i++, texData, dataSize, rnd);
-    *input++ = getInput(i++, texData, dataSize, rnd);
-    *input++ = getInput(i++, texData, dataSize, rnd);
-    *input++ = getInput(i++, texData, dataSize, rnd);
+    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
+    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
+    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
+    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
   }
   if (texData) free(texData);
 }
@@ -414,7 +417,7 @@ int main (int argc, char** argv)
       if (thrust)
       {
         #if ENABLE_THRUST
-          testHistogramParamThrust(INPUT, index_0, index_1, print);
+          testHistogramParamThrust(INPUT, index_0, 4*index_1, print);
         #else
           printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
           break;

@@ -28,7 +28,12 @@
 #define TEST_IS_POW2 1
 #define NRUNS 1000
 
-#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
+#define ENABLE_THRUST   0
+#endif
+
 #ifndef NONPP
 #define ENABLE_NPP      1   // NOTE: In order to link, use: -lnpp -L /usr/local/cuda/lib64/ (or similar)
 #endif
@@ -58,6 +63,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>*/
 
+
 #if ENABLE_THRUST
 #include <thrust/transform_reduce.h>
 #include <thrust/functional.h>
@@ -67,7 +73,6 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/sort.h>
 #endif
-
 
 #include <stdio.h>
 
@@ -218,7 +223,7 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
 
 // NOTE: Take advantage here of the fact that this is the classical histogram with all values = 1
 // And also that we know before hand the number of indices coming out
-static void testHistogramParamThrust(int* INPUT, int index_0, int index_1, bool print)
+static void testHistogramParamThrust(unsigned char* INPUT, int index_0, int index_1, bool print)
 {
   test_sumfun2 mysumfun;
   thrust::equal_to<int> binary_pred;
@@ -228,7 +233,7 @@ static void testHistogramParamThrust(int* INPUT, int index_0, int index_1, bool 
   thrust::device_vector<int> vals_out(nIndex);
   thrust::device_vector<int> h_vals_out(nIndex);
   //thrust::device_vector<int> keys(N);
-  thrust::device_ptr<int> keys(INPUT);
+  thrust::device_ptr<unsigned char> keys(INPUT);
   // Sort the data
   thrust::sort(keys, keys + N);
   // And reduce by key - histogram complete
@@ -439,7 +444,7 @@ int main (int argc, char** argv)
       if (thrust)
       {
         #if ENABLE_THRUST
-          testHistogramParamThrust(INPUT, index_0, index_1, print);
+          testHistogramParamThrust((unsigned char*)INPUT, 0, 4*nPixels, print);
         #else
           printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
           break;

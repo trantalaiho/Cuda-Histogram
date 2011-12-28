@@ -85,7 +85,7 @@ getHistogramBufSize(OUTPUTTYPE zero, int nOut);
  *                  INPUTTYPE* input, int index, int* result_index,
  *                  OUTPUTTYPE* results, int nresults) const
  *              {
- *                  *result_index[0] = <Some bin-number - from 0 to nOut>;
+ *                  *result_index[0] = <Some bin-number - from 0 to nOut - 1>;
  *                  *results = input[i];
  *              }
  *          };
@@ -163,9 +163,9 @@ callHistogramKernel(
 
 const int numActiveUpperLimit = 24;
 
-#define USE_JENKINS_HASH 1
+#define USE_JENKINS_HASH 0
 
-#define LARGE_NBIN_CHECK_INTERVAL_LOG2  7
+#define LARGE_NBIN_CHECK_INTERVAL_LOG2  5
 #define LARGE_NBIN_CHECK_INTERVAL       (1 << LARGE_NBIN_CHECK_INTERVAL_LOG2)
 
 #define SMALL_BLOCK_SIZE_LOG2   6
@@ -1152,22 +1152,19 @@ do {                                \
 } while (0)
 
 static inline __device__
-int histogramHashFunction(int key)
+unsigned int histogramHashFunction(int key)
 {
-#if 1
 #if USE_JENKINS_HASH
-    int a = key;
-    int c,b;
+    unsigned int a = (unsigned int)key;
+    unsigned int c,b;
     // TODO: What are good constants?
     b = 0x9e3779b9;
     c = 0xf1232345;
     HISTO_JENKINS_MIX(a, b, c);
     return c;
 #else
-    return key;
-#endif
-#else
-    return key * 1664525 + 1013904223;
+    // Golden ratio hash
+    return (0x9e3779b9u * (unsigned int)key);
 #endif
 }
 
@@ -1177,9 +1174,9 @@ template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite)
 {
-    int hashkey = histogramHashFunction(myKey);
+    unsigned int hashkey = histogramHashFunction(myKey);
     volatile __shared__ bool hashFull;
-    int index = (hashkey & ((1 << hashSizelog2) - 1));
+    int index = (int)(hashkey >> (32 - hashSizelog2));
     bool Iamdone = false;
 
     int i = HASH_COLLISION_STEPS;
@@ -1245,12 +1242,13 @@ template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite)
 {
-    int hashkey = histogramHashFunction(myKey);
+    unsigned int hashkey = histogramHashFunction(myKey);
     volatile __shared__ int hashFull;
-    int index = (hashkey & ((1 << hashSizelog2) - 1));
+    int index = (int)(hashkey >> (32 - hashSizelog2));
     bool Iamdone = false;
+    bool IFlush = Iwrite;
 
-    int i = HASH_COLLISION_STEPS;
+    //int i = HASH_COLLISION_STEPS;
     hashFull = -10;
     //int safe = 200;
     while (hashFull != 0 /*&& safe-- > 0*/)
@@ -1271,7 +1269,7 @@ void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFU
             if (*lock == threadIdx.x) // We won!
             {
                 int key = hash->keys[index];
-                if (key== -1)
+                if (key == -1)
                 {
                     hash->keys[index] = myKey;
                     hash->vals[index] = res;
@@ -1281,6 +1279,7 @@ void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFU
                 {
                     hash->vals[index] = sumfunObj(res, hash->vals[index]);
                     Iamdone = true;
+                    IFlush = false;
                 }
                 else
                 {
@@ -1291,17 +1290,26 @@ void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFU
                 *lock = TMP_LOCK_MAGIC;
             }
         }
-        if (--i == 0 && hashFull != 0)
+//        if (--i == 0 && hashFull != 0)
         {
             // Enough tries already without finding a free entry, flush the hash and keep going...
-            FlushHash(hash, sumfunObj, hashSizelog2);
-            i = HASH_COLLISION_STEPS;
-            index = (hashkey & ((1 << hashSizelog2) - 1));
+            //FlushHash(hash, sumfunObj, hashSizelog2);
+            if (IFlush)
+            {
+                OUTPUTTYPE* myVal = &hash->vals[index];
+                int* key = &hash->keys[index];
+                // TODO: Workaround - get rid of if. Where do the extra flushes come from?
+                if (*key >= 0) hash->myBlockOut[*key] = sumfunObj(*myVal, hash->myBlockOut[*key]);
+                *key = -1;
+            }
+
+//            i = HASH_COLLISION_STEPS;
+            //index = (hashkey & ((1 << hashSizelog2) - 1));
         }
-        else
+/*        else
         {
             index = (index + 1) & ((1 << hashSizelog2) - 1);
-        }
+        }*/
     }
 #undef TMP_LOCK_MAGIC
 }
@@ -1323,15 +1331,25 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
             OUTPUTTYPE res[nMultires];
             xformObj(input, *myStart, &myKeys[0], &res[0], nMultires);
             // TODO: Unroll? addtoHash is a big function.. Hmm but, unrolling would enable registers probably
+            bool Iwrite;
+#define     ADD_ONE_RESULT(RESIDX, NSAME, CHECK)                                                                               \
+            do { if (RESIDX < nMultires) {                                                                              \
+                Iwrite = reduceToUnique<histotype, CHECK>                                                                \
+                    (&res[RESIDX % nMultires], myKeys[RESIDX % nMultires], NSAME, sumfunObj, rKeys, rOuts);             \
+                AddToHash(res[RESIDX % nMultires], myKeys[RESIDX % nMultires], hash, sumfunObj, hashSizelog2, Iwrite);  \
+            } } while (0)
+            ADD_ONE_RESULT(0, &nSame, true);
+            ADD_ONE_RESULT(1, NULL, false);
+            ADD_ONE_RESULT(2, NULL, false);
+            ADD_ONE_RESULT(3, NULL, false);
+#undef ADD_ONE_RESULT
             //#pragma unroll
-            for (int resid = 0; resid < nMultires; resid++)
+            for (int resid = 4; resid < nMultires; resid++)
             {
-                bool Iwrite = reduceToUnique<histotype, true>(&res[resid], myKeys[resid], resid == 0 ? &nSame : NULL, sumfunObj, rKeys, rOuts);
-                if (resid == 0)
-                    *nSameTot += nSame;
-                //*reduceOut = true;
+                bool Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
                 AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite);
             }
+            *nSameTot += nSame;
             checkStrategyFun(reduceOut, nSame, *nSameTot, stepNum, 0);
             *myStart += HBLOCK_SIZE;
         }
@@ -1344,7 +1362,20 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
                 OUTPUTTYPE res[nMultires];
                 xformObj(input, *myStart, &myKeys[0], &res[0], nMultires);
                 //#pragma unroll
-                for (int resid = 0; resid < nMultires; resid++)
+                bool Iwrite = true;
+#define ADD_ONE_RESULT(RES) \
+                do { if (RES < nMultires) { \
+                  if (reduce) Iwrite = reduceToUnique<histotype, false>(&res[RES % nMultires],      \
+                                        myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);    \
+                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash,                    \
+                                sumfunObj, hashSizelog2, Iwrite);                                   \
+                 } } while (0)
+                ADD_ONE_RESULT(0);
+                ADD_ONE_RESULT(1);
+                ADD_ONE_RESULT(2);
+                ADD_ONE_RESULT(3);
+#undef ADD_ONE_RESULT
+                for (int resid = 4; resid < nMultires; resid++)
                 {
                     bool Iwrite = true;
                     if (reduce)
@@ -1367,13 +1398,37 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
                 Iwrite = true;
                 xformObj(input, *myStart, &myKeys[0], &res[0], nMultires);
             }
+            else
+            {
+            #pragma unroll
+              for (int resid = 0; resid < nMultires; resid++)
+              {
+                res[resid] = zero;
+                myKeys[resid] = 0;
+              }
+            }
             //#pragma unroll
-            for (int resid = 0; resid < nMultires; resid++)
             {
                 bool Iwrite2 = Iwrite;
-                if (reduce) if (Iwrite)
-                    Iwrite2 = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
-                AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite2);
+#define     ADD_ONE_RESULT(RES)             \
+                do { if (RES < nMultires) { \
+                  if (reduce) Iwrite2 = reduceToUnique<histotype, false>                                          \
+                    (&res[RES % nMultires], myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);            \
+                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash, sumfunObj, hashSizelog2, Iwrite2);\
+                } } while(0)
+
+                ADD_ONE_RESULT(0);
+                ADD_ONE_RESULT(1);
+                ADD_ONE_RESULT(2);
+                ADD_ONE_RESULT(3);
+                #undef ADD_ONE_RESULT
+                for (int resid = 4; resid < nMultires; resid++)
+                {
+                    //bool Iwrite2 = true;
+                    if (reduce)
+                        Iwrite2 = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
+                    AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite2);
+                }
             }
             *myStart += HBLOCK_SIZE;
         }
@@ -1447,7 +1502,7 @@ void histo_kernel_largeNBins(
                 (input, xformObj, sumfunObj, zero, &myStart, end, &hash, blockOut, nOut, stepNum, nstepsleft, &nSameTot, &reduce, hashSizelog2, rOuts, rKeys);
     }
     // Flush values still in hash
-    FlushHash(&hash, sumfunObj, hashSizelog2);
+    //FlushHash(&hash, sumfunObj, hashSizelog2);
 }
 
 #if 0 // Not a working code-path - we could consider this for some large-bin paths
@@ -1520,8 +1575,8 @@ void histo_kernel_mediumNBins(
 static int determineHashSizeLog2(size_t outSize, int* nblocks, cudaDeviceProp* props)
 {
     // TODO: Magic hat-constant 500 reserved for inputs, how to compute?
-    int sharedTot = (props->sharedMemPerBlock - 500) / 2;
-    //int sharedTot = 16000;
+    int sharedTot = (props->sharedMemPerBlock - 500) / 1;
+    //int sharedTot = 32000;
     // How many blocks of 32 keys could we have?
     //int nb32Max = sharedTot / (32 * outSize);
     // But ideally we should run at least 4 active blocks per SM,

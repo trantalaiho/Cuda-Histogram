@@ -150,6 +150,20 @@ callHistogramKernel(
 
 #define HBLOCK_SIZE_LOG2    5
 #define HBLOCK_SIZE         (1 << HBLOCK_SIZE_LOG2) // = 32
+
+#define LBLOCK_SIZE_LOG2    5
+#define LBLOCK_SIZE         (1 << LBLOCK_SIZE_LOG2) // = 256
+#define LBLOCK_WARPS        (LBLOCK_SIZE >> 5)
+
+#define USE_MEDIUM_PATH         1
+
+#if USE_MEDIUM_PATH
+// For now only MEDIUM_BLOCK_SIZE_LOG2 == LBLOCK_SIZE_LOG2 works
+#   define MEDIUM_BLOCK_SIZE_LOG2   LBLOCK_SIZE_LOG2
+#   define MEDIUM_BLOCK_SIZE        (1 << MEDIUM_BLOCK_SIZE_LOG2) // 128
+#   define MBLOCK_WARPS             (MEDIUM_BLOCK_SIZE >> 5)
+#endif
+
 #define RBLOCK_SIZE         64
 #define RMAXSTEPS           80
 #define NHSTEPSPERKEY       32
@@ -158,6 +172,7 @@ callHistogramKernel(
 
 #define STRATEGY_CHECK_INTERVAL_LOG2    7
 #define STRATEGY_CHECK_INTERVAL         (1 << STRATEGY_CHECK_INTERVAL_LOG2)
+
 
 #define HASH_COLLISION_STEPS    2
 
@@ -415,7 +430,7 @@ bool ballot_makeUnique(
   unsigned int mymask;
 
   #if HBLOCK_SIZE != 32
-  #error Sorry - new histogram kernel implemented only for 32-thread blocksize!
+  #error Please use threadblocks of 32 threads
   #endif
   //startKey = s_keys[startIndex];
   // First dig out for each thread who are the other threads that have the same key as us...
@@ -625,6 +640,7 @@ void myAtomicAddStats(OUTPUTTYPE* addr, OUTPUTTYPE val, volatile int* keyAddr, S
 
 #endif
 
+// TODO: Make unique within one warp?
 template<histogram_type histotype, bool checkNSame, typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj, int* keys, OUTPUTTYPE* outputs)
@@ -1077,6 +1093,10 @@ void histogramKernel_sharedbins_new(
 }
 
 
+// TODO: Consider the following:
+// First private hash for each warp - later, share hash-tables between warps
+// Try also: private hashes for some threads of one warp etc
+
 template <typename OUTPUTTYPE>
 struct myHash
 {
@@ -1094,26 +1114,26 @@ template <typename OUTPUTTYPE>
 static inline __device__
 void InitHash(struct myHash<OUTPUTTYPE> *hash, OUTPUTTYPE zero, int hashSizelog2)
 {
-    int nloops = (1 << hashSizelog2) >> HBLOCK_SIZE_LOG2;
+    int nloops = (1 << hashSizelog2) >> LBLOCK_SIZE_LOG2;
     int* myEntry = &hash->keys[threadIdx.x];
     for (int i = 0; i < nloops; i++)
     {
         *myEntry = -1;
-        myEntry += HBLOCK_SIZE;
+        myEntry += LBLOCK_SIZE;
     }
-    if ((nloops << HBLOCK_SIZE_LOG2) + threadIdx.x < (1 << hashSizelog2))
+    if ((nloops << LBLOCK_SIZE_LOG2) + threadIdx.x < (1 << hashSizelog2))
     {
         *myEntry = -1;
     }
     // Done
 }
 
-
+#if 0 // OLD code
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 void FlushHash(struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2)
 {
-    int nloops = (1 << hashSizelog2) >> HBLOCK_SIZE_LOG2;
+    int nloops = (1 << hashSizelog2) >> LBLOCK_SIZE_LOG2;
     OUTPUTTYPE* myVal = &hash->vals[threadIdx.x];
     int* key = &hash->keys[threadIdx.x];
     for (int i = 0; i < nloops; i++) {
@@ -1122,10 +1142,10 @@ void FlushHash(struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSi
             hash->myBlockOut[keyIndex] = sumfunObj(*myVal, hash->myBlockOut[keyIndex]);
             *key = -1;
         }
-        key += HBLOCK_SIZE;
-        myVal += HBLOCK_SIZE;
+        key += LBLOCK_SIZE;
+        myVal += LBLOCK_SIZE;
     }
-    if ((nloops << HBLOCK_SIZE_LOG2) + threadIdx.x < (1 << hashSizelog2))
+    if ((nloops << LBLOCK_SIZE_LOG2) + threadIdx.x < (1 << hashSizelog2))
     {
       int keyIndex = *key;
       if (keyIndex >= 0){
@@ -1134,7 +1154,7 @@ void FlushHash(struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSi
       }
     }
 }
-
+#endif // 0
 
 // See: http://www.burtleburtle.net/bob/hash/doobs.html
 // Mix by Bob Jenkins
@@ -1172,86 +1192,106 @@ unsigned int histogramHashFunction(int key)
 #if USE_ATOMICS_HASH
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
-void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite)
+void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite, bool unique)
 {
+    if (unique)
+    {
+        if (Iwrite)
+        {
+            hash->myBlockOut[myKey] = sumfunObj(res, hash->myBlockOut[myKey]);
+        }
+        return;
+    }
     unsigned int hashkey = histogramHashFunction(myKey);
     volatile __shared__ bool hashFull;
     int index = (int)(hashkey >> (32 - hashSizelog2));
-    bool Iamdone = false;
+    bool Iamdone = !Iwrite;
+    bool IFlush = Iwrite;
 
-    int i = HASH_COLLISION_STEPS;
-    if (threadIdx.x == 0) hashFull = true;
+    hashFull = true;
     while (hashFull)
     {
-        // Mark here hash not full, and if any thread has problems finding
+        // Mark here hash full, and if any thread has problems finding
         // free entry in hash, then that thread sets hashFull to nonzero
         if (threadIdx.x == 0) hashFull = false;
+        // Do atomic-part
         int old = -2;
         int expect = -1;
-        if (!Iamdone) expect = hash->keys[index];
-        if (expect != -1 && expect != myKey)
+        while (!Iamdone && !hashFull)
         {
-          {
-            old = expect; // Don't even try...
-            hashFull = true;
-          }
-        }
-        // Do atomic-part
-        while (!Iamdone && old != expect && Iwrite)
-        {
-          old = atomicCAS(&hash->keys[index], expect, -2 - ((int)threadIdx.x));
-          if (old == expect)
-          {
-            // WE WON!
-            Iamdone = true;
-            hash->keys[index] = myKey;
-            if (old == -1)
-              hash->vals[index] = res;
-            else
-              hash->vals[index] = sumfunObj(hash->vals[index], res);
-          }
-          else
-          {
-            // Somebody else won the race for that hash-slot, let's see if they had the same key as us
-            if (hash->keys[index] == myKey)
-            { // They did! How wonderful - we can add there on the next loop:
-              expect = myKey;
+            old = atomicCAS(&hash->keys[index], expect, -3);
+            if (old == expect) // We won!
+            {
+                int key = old;
+                if (key == -1 || key == myKey)
+                {
+                    if (key == -1)
+                    {
+                        hash->vals[index] = res;
+                    }
+                    else
+                    {
+                        hash->vals[index] = sumfunObj(res, hash->vals[index]);
+                        IFlush = false;
+                    }
+                    hash->keys[index] = myKey;
+                    Iamdone = true;
+                }
+                else
+                {
+                    hashFull = true;
+                    hash->keys[index] = key;
+                    expect = -1;
+                }
             }
             else
-            {  // Buhuhu - they wrote some blah-blah key to our slot, we need a new one! Exit loop
-              expect = old;
-              hashFull = true;
+            {
+
+                if (old != myKey)
+                {
+                    hashFull = true;
+                    expect = -1;
+                }
+                else
+                {
+                    expect = old;
+                }
             }
-          }
         }
-        if (--i == 0 && hashFull)
+        if (IFlush && Iamdone)
         {
-            // Enough tries already without finding a free entry, flush the hash and keep going...
-            FlushHash(hash, sumfunObj, hashSizelog2);
-            i = HASH_COLLISION_STEPS;
-            index = (hashkey & ((1 << hashSizelog2) - 1));
-        }
-        else
-        {
-            index = (index + 1) & ((1 << hashSizelog2) - 1);
+            OUTPUTTYPE* myVal = &hash->vals[index];
+            int* key = &hash->keys[index];
+            // TODO: Workaround - get rid of if. Where do the extra flushes come from?
+            if (*key >= 0) hash->myBlockOut[*key] = sumfunObj(*myVal, hash->myBlockOut[*key]);
+            //hash->myBlockOut[myKey] = sumfunObj(*myVal, hash->myBlockOut[myKey]);
+            *key = -1;
         }
     }
 }
+
 #else
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
-void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite)
+void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFUNTYPE sumfunObj, int hashSizelog2, bool Iwrite, bool unique)
 {
+    if (unique)
+    {
+        if (Iwrite)
+        {
+            hash->myBlockOut[myKey] = sumfunObj(res, hash->myBlockOut[myKey]);
+        }
+        return;
+    }
     unsigned int hashkey = histogramHashFunction(myKey);
     volatile __shared__ int hashFull;
     int index = (int)(hashkey >> (32 - hashSizelog2));
     bool Iamdone = false;
     bool IFlush = Iwrite;
 
-    //int i = HASH_COLLISION_STEPS;
+    // TODO: syncthreads()...
     hashFull = -10;
-    //int safe = 200;
-    while (hashFull != 0 /*&& safe-- > 0*/)
+    while (hashFull != 0)
     {
         volatile int* lock = &hash->locks[index];
         bool write = Iwrite;
@@ -1290,26 +1330,14 @@ void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFU
                 *lock = TMP_LOCK_MAGIC;
             }
         }
-//        if (--i == 0 && hashFull != 0)
+        if (IFlush)
         {
-            // Enough tries already without finding a free entry, flush the hash and keep going...
-            //FlushHash(hash, sumfunObj, hashSizelog2);
-            if (IFlush)
-            {
-                OUTPUTTYPE* myVal = &hash->vals[index];
-                int* key = &hash->keys[index];
-                // TODO: Workaround - get rid of if. Where do the extra flushes come from?
-                if (*key >= 0) hash->myBlockOut[*key] = sumfunObj(*myVal, hash->myBlockOut[*key]);
-                *key = -1;
-            }
-
-//            i = HASH_COLLISION_STEPS;
-            //index = (hashkey & ((1 << hashSizelog2) - 1));
+            OUTPUTTYPE* myVal = &hash->vals[index];
+            int* key = &hash->keys[index];
+            // TODO: Workaround - get rid of if. Where do the extra flushes come from?
+            if (*key >= 0) hash->myBlockOut[*key] = sumfunObj(*myVal, hash->myBlockOut[*key]);
+            *key = -1;
         }
-/*        else
-        {
-            index = (index + 1) & ((1 << hashSizelog2) - 1);
-        }*/
     }
 #undef TMP_LOCK_MAGIC
 }
@@ -1332,11 +1360,12 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
             xformObj(input, *myStart, &myKeys[0], &res[0], nMultires);
             // TODO: Unroll? addtoHash is a big function.. Hmm but, unrolling would enable registers probably
             bool Iwrite;
-#define     ADD_ONE_RESULT(RESIDX, NSAME, CHECK)                                                                               \
-            do { if (RESIDX < nMultires) {                                                                              \
-                Iwrite = reduceToUnique<histotype, CHECK>                                                                \
-                    (&res[RESIDX % nMultires], myKeys[RESIDX % nMultires], NSAME, sumfunObj, rKeys, rOuts);             \
-                AddToHash(res[RESIDX % nMultires], myKeys[RESIDX % nMultires], hash, sumfunObj, hashSizelog2, Iwrite);  \
+#define     ADD_ONE_RESULT(RESIDX, NSAME, CHECK)                                                                               	\
+            do { if (RESIDX < nMultires) {                                                                                     	\
+                Iwrite = reduceToUnique<histotype, CHECK>                                                                      	\
+                    (&res[RESIDX % nMultires], myKeys[RESIDX % nMultires], NSAME, sumfunObj, rKeys, rOuts);             		\
+                if ((threadIdx.x) < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1;                                          \
+                AddToHash(res[RESIDX % nMultires], myKeys[RESIDX % nMultires], hash, sumfunObj, hashSizelog2, Iwrite, true);  	\
             } } while (0)
             ADD_ONE_RESULT(0, &nSame, true);
             ADD_ONE_RESULT(1, NULL, false);
@@ -1347,16 +1376,17 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
             for (int resid = 4; resid < nMultires; resid++)
             {
                 bool Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
-                AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite);
+                if ((threadIdx.x) < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1;
+                AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite, true);
             }
             *nSameTot += nSame;
             checkStrategyFun(reduceOut, nSame, *nSameTot, stepNum, 0);
-            *myStart += HBLOCK_SIZE;
+            *myStart += LBLOCK_SIZE;
         }
         else
         {
-            int startLim = *myStart + ((HBLOCK_SIZE << LARGE_NBIN_CHECK_INTERVAL_LOG2) - HBLOCK_SIZE);
-            for (; *myStart < startLim; *myStart += HBLOCK_SIZE)
+            int startLim = *myStart + ((LBLOCK_SIZE << LARGE_NBIN_CHECK_INTERVAL_LOG2) - LBLOCK_SIZE);
+            for (; *myStart < startLim; *myStart += LBLOCK_SIZE)
             {
                 int myKeys[nMultires];
                 OUTPUTTYPE res[nMultires];
@@ -1365,10 +1395,11 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
                 bool Iwrite = true;
 #define ADD_ONE_RESULT(RES) \
                 do { if (RES < nMultires) { \
-                  if (reduce) Iwrite = reduceToUnique<histotype, false>(&res[RES % nMultires],      \
-                                        myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);    \
-                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash,                    \
-                                sumfunObj, hashSizelog2, Iwrite);                                   \
+                  if (reduce){ Iwrite = reduceToUnique<histotype, false>(&res[RES % nMultires],         \
+                                        myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);        \
+                               if (threadIdx.x < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1;}    \
+                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash,                        \
+                                sumfunObj, hashSizelog2, Iwrite, reduce);                               \
                  } } while (0)
                 ADD_ONE_RESULT(0);
                 ADD_ONE_RESULT(1);
@@ -1378,9 +1409,11 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
                 for (int resid = 4; resid < nMultires; resid++)
                 {
                     bool Iwrite = true;
-                    if (reduce)
+                    if (reduce){
                         Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
-                    AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite);
+                        if (threadIdx.x < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1;
+                    }
+                    AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite, reduce);
                 }
             }
         }
@@ -1410,11 +1443,12 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
             //#pragma unroll
             {
                 bool Iwrite2 = Iwrite;
-#define     ADD_ONE_RESULT(RES)             \
-                do { if (RES < nMultires) { \
-                  if (reduce) Iwrite2 = reduceToUnique<histotype, false>                                          \
-                    (&res[RES % nMultires], myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);            \
-                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash, sumfunObj, hashSizelog2, Iwrite2);\
+#define     ADD_ONE_RESULT(RES)             																				\
+                do { if (RES < nMultires) { 																				\
+                  if (reduce){ Iwrite2 = reduceToUnique<histotype, false>                                          			\
+                    (&res[RES % nMultires], myKeys[RES % nMultires], NULL, sumfunObj, rKeys, rOuts);            			\
+                    if (threadIdx.x < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1; }                                  \
+                  AddToHash(res[RES % nMultires], myKeys[RES % nMultires], hash, sumfunObj, hashSizelog2, Iwrite2, reduce);	\
                 } } while(0)
 
                 ADD_ONE_RESULT(0);
@@ -1425,12 +1459,14 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
                 for (int resid = 4; resid < nMultires; resid++)
                 {
                     //bool Iwrite2 = true;
-                    if (reduce)
+                    if (reduce){
                         Iwrite2 = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, rKeys, rOuts);
-                    AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite2);
+                        if (threadIdx.x < (1 << hashSizelog2)) hash->keys[threadIdx.x] = -1;
+                    }
+                    AddToHash(res[resid], myKeys[resid], hash, sumfunObj, hashSizelog2, Iwrite2, reduce);
                 }
             }
-            *myStart += HBLOCK_SIZE;
+            *myStart += LBLOCK_SIZE;
         }
     }
 }
@@ -1451,12 +1487,19 @@ void histo_kernel_largeNBins(
     extern __shared__ int keys[];
 #if USE_ATOMICS_HASH
     OUTPUTTYPE* vals = (OUTPUTTYPE*)(&keys[1 << hashSizelog2]);
+    if (hashSizelog2 < LBLOCK_SIZE_LOG2)
+        vals = &keys[1 << LBLOCK_SIZE_LOG2];
 #else
     int* locks = &keys[1 << hashSizelog2];
+    if (hashSizelog2 < LBLOCK_SIZE_LOG2)
+        locks = &keys[1 << LBLOCK_SIZE_LOG2];
     OUTPUTTYPE* vals = (OUTPUTTYPE*)(&locks[1 << hashSizelog2]);
 #endif
-    int* rKeys = (int*)(&vals[1 << hashSizelog2]);
-    OUTPUTTYPE* rOuts = (OUTPUTTYPE*)(&rKeys[HBLOCK_SIZE]);
+    /*int* rKeys = (int*)(&vals[1 << hashSizelog2]);
+    OUTPUTTYPE* rOuts = (OUTPUTTYPE*)(&rKeys[LBLOCK_SIZE]);*/
+
+    int* rKeys = &keys[0];
+    OUTPUTTYPE* rOuts = vals;
 
     struct myHash<OUTPUTTYPE> hash;
 
@@ -1465,10 +1508,10 @@ void histo_kernel_largeNBins(
     hash.locks = locks;
 #endif
     hash.vals = vals;
-    // Where do we put the results from our block?
+    // Where do we put the results from our warp (block)?
     hash.myBlockOut = &blockOut[nOut * blockIdx.x];
 
-    int myStart = start + ((blockIdx.x * nSteps) << HBLOCK_SIZE_LOG2) + threadIdx.x;
+    int myStart = start + ((blockIdx.x * nSteps) << LBLOCK_SIZE_LOG2) + threadIdx.x;
     // Assert that myStart is not out of bounds!
     int nFullSteps = nSteps >> LARGE_NBIN_CHECK_INTERVAL_LOG2;
     bool reduce = false;
@@ -1505,12 +1548,9 @@ void histo_kernel_largeNBins(
     //FlushHash(&hash, sumfunObj, hashSizelog2);
 }
 
-#if 0 // Not a working code-path - we could consider this for some large-bin paths
-// Note: Has to be 5!
-#define MEDIUM_BLOCK_SIZE_LOG2  5
-#define MEDIUM_BLOCK_SIZE  (1 << MEDIUM_BLOCK_SIZE_LOG2) // 128
+#if USE_MEDIUM_PATH
 
-
+#if 0
 //blockAtomicOut(ourOut, locks, myOut, myKey, sumfunObj);
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
@@ -1533,11 +1573,11 @@ void blockAtomicOut(OUTPUTTYPE* blockOut, char* locks, OUTPUTTYPE res, int myKey
         }
     }
 #undef TMP_LOCK_MAGIC
-    __syncthreads();
+    //__syncthreads();
 }
+#endif
 
-#if 0
-template <histogram_type histotype, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
 __global__
 void histo_kernel_mediumNBins(
     INPUTTYPE input,
@@ -1548,25 +1588,84 @@ void histo_kernel_mediumNBins(
     OUTPUTTYPE* blockOut, int nOut,
     int nSteps)
 {
-    extern __shared__ char locks[];
+#if __CUDA_ARCH__ >= 120
     OUTPUTTYPE* ourOut = &blockOut[nOut * blockIdx.x];
-    int myStart = start + ((blockIdx.x * nSteps) << HBLOCK_SIZE_LOG2) + threadIdx.x;
+    int myStart = start + ((blockIdx.x * nSteps) << MEDIUM_BLOCK_SIZE_LOG2) + threadIdx.x;
+    bool reduce = false;
+    int nSameTot = 0;
     for (int step = 0; step < nSteps - 1; step++)
     {
-        int myKey = 0;
-        OUTPUTTYPE myOut = xformObj(input, myStart, &myKey);
-        blockAtomicOut(ourOut, locks, myOut, myKey, sumfunObj);
+        bool check = false;
+        int myKey[nMultires];
+        OUTPUTTYPE myOut[nMultires];
+        xformObj(input, myStart, &myKey[0], &myOut[0],nMultires);
+        // TODO: magic constant
+        if ((step & 63) == 0)
+            check = true;
+        {
+            int nSame;
+            __shared__ int keys[MEDIUM_BLOCK_SIZE];
+            __shared__ OUTPUTTYPE rOut[MEDIUM_BLOCK_SIZE];
+            //int warpIdx = threadIdx.x >> 5;
+            int* wkeys = &keys[0/*warpIdx << 5*/];
+            OUTPUTTYPE* wOut = &rOut[0/*warpIdx << 5*/];
+            bool Iwrite;
+#define ADD_ONE_RESULT(RESID)                                                                   \
+            do { if (RESID < nMultires) {                                                       \
+                if (reduce || check){                                                           \
+                    if (check) Iwrite = reduceToUnique<histotype, true>                         \
+                        (&myOut[RESID % nMultires], myKey[RESID % nMultires],                   \
+                            &nSame, sumfunObj, wkeys, wOut);                                    \
+                    else Iwrite = reduceToUnique<histotype, false>                              \
+                        (&myOut[RESID % nMultires], myKey[RESID % nMultires], NULL, sumfunObj,  \
+                            wkeys, wOut);                                                       \
+                    if (Iwrite)                                                                 \
+                        ourOut[myKey[RESID % nMultires]] = sumfunObj(                           \
+                                ourOut[myKey[RESID % nMultires]], myOut[RESID % nMultires]);    \
+                    if (check){                                                                 \
+                        nSameTot += nSame;                                                      \
+                        checkStrategyFun(&reduce, nSame, nSameTot, step, 0);                    \
+                        check = false;                                                          \
+                    }                                                                           \
+                } else {                                                                        \
+                    if (histotype == histogram_atomic_inc)                                      \
+                        atomicAdd(&ourOut[myKey[RESID % nMultires]], 1);                        \
+                    else if (histotype == histogram_atomic_add)                                 \
+                        atomicAdd(&ourOut[myKey[RESID % nMultires]], myOut[RESID % nMultires]); \
+                } }                                                                             \
+            } while(0)
+            ADD_ONE_RESULT(0);
+            ADD_ONE_RESULT(1);
+            ADD_ONE_RESULT(2);
+            ADD_ONE_RESULT(3);
+ //#pragma unroll
+            for (int resid = 4; resid < nMultires; resid++)
+            {
+                ADD_ONE_RESULT(resid);
+            }
+        }
         myStart += MEDIUM_BLOCK_SIZE;
     }
     if (myStart < end)
     {
-        int myKey = 0;
-        OUTPUTTYPE myOut = xformObj(input, myStart, &myKey);
-        blockAtomicOut(ourOut, locks, myOut, myKey, sumfunObj);
+        int myKey[nMultires];
+        OUTPUTTYPE myOut[nMultires];
+        xformObj(input, myStart, &myKey[0], &myOut[0],nMultires);
+        for (int resid = 0; resid < nMultires; resid++)
+        {
+            if (histotype == histogram_atomic_inc)
+            {
+                atomicAdd(&ourOut[myKey[resid]], 1);
+            }
+            else if (histotype == histogram_atomic_add)
+            {
+                atomicAdd(&ourOut[myKey[resid]], myOut[resid]);
+            }
+        }
     }
+#endif // __CUDA_ARCH__
 }
-#endif
-#endif // 0
+#endif // USE_MEDIUM_PATH
 
 
 
@@ -1575,15 +1674,16 @@ void histo_kernel_mediumNBins(
 static int determineHashSizeLog2(size_t outSize, int* nblocks, cudaDeviceProp* props)
 {
     // TODO: Magic hat-constant 500 reserved for inputs, how to compute?
-    int sharedTot = (props->sharedMemPerBlock - 500) / 1;
+    int sharedTot = (props->sharedMemPerBlock - 500) /* / LBLOCK_WARPS*/;
     //int sharedTot = 32000;
     // How many blocks of 32 keys could we have?
     //int nb32Max = sharedTot / (32 * outSize);
     // But ideally we should run at least 4 active blocks per SM,
-    // How can we balance this? Well - with very low ablock-values (a), we perform bad, but after 4, adding more
+    // How can we balance this? Well - with very low ablock-values (a),
+	// we perform bad, but after 4, adding more
     // will help less and less, whereas adding more to the hash always helps!
 #if USE_ATOMICS_HASH
-    outSize += 2*sizeof(int);
+    outSize += sizeof(int);
 #else
     outSize += sizeof(int);
 #endif
@@ -1645,9 +1745,9 @@ void callHistogramKernelLargeNBins(
       if (getTmpBufSize) getTmpBufSize = 0;
         return;
     }
-    const dim3 block = HBLOCK_SIZE;
+    const dim3 block = LBLOCK_SIZE;
     dim3 grid = nblocks;
-    int nSteps = size / ( HBLOCK_SIZE * nblocks);
+    int nSteps = size / ( LBLOCK_SIZE * nblocks);
     OUTPUTTYPE* tmpOut;
     //int n = nblocks;
     if (getTmpBufSize) {
@@ -1668,13 +1768,18 @@ void callHistogramKernelLargeNBins(
     int extSharedNeeded = (1 << hashSizelog2) * (sizeof(OUTPUTTYPE) + sizeof(int) * 2);
 #endif
 
+    // The shared memory here is needed for the reduction code (ie. reduce to unique)
+    // TODO: new hash-code could probably reuse the memory reserved for the hash-table,
+    // it would just need to reinit the keys to -1 after use - think about it.
     if (cuda_arch >= 200 && histotype == histogram_atomic_inc)
     {
-        extSharedNeeded += (sizeof(int) << HBLOCK_SIZE_LOG2);
+        if (hashSizelog2 < LBLOCK_SIZE_LOG2)
+            extSharedNeeded += (sizeof(int) << (LBLOCK_SIZE_LOG2 - hashSizelog2));
     }
     else
     {
-        extSharedNeeded += ((sizeof(OUTPUTTYPE) + sizeof(int)) << HBLOCK_SIZE_LOG2);
+        if (hashSizelog2 < LBLOCK_SIZE_LOG2)
+            extSharedNeeded += ((sizeof(OUTPUTTYPE) + sizeof(int)) << (LBLOCK_SIZE_LOG2 - hashSizelog2));
     }
     //printf("binsets = %d, steps = %d\n", (1 << nKeysetslog2), nsteps);
 
@@ -1700,11 +1805,12 @@ void callHistogramKernelLargeNBins(
 
 
     //int medExtShared = nOut;
-    // THIS CODEPATH IS SLOWER WITH FERMI!
     //const int shLimit = 0;
     //const int shLimit = 0;//16000 / 2;
-#if 0
-    if (medExtShared <= shLimit)
+    // Codepath below is a lot faster for random bins, a tad faster for real use-case
+    // and a lot slower for degenerate key-distributions
+#if USE_MEDIUM_PATH
+    if (cuda_arch >= 120 && (histotype == histogram_atomic_inc || histotype == histogram_atomic_add))
     {
         const dim3 block = MEDIUM_BLOCK_SIZE;
         dim3 grid = nblocks;
@@ -1724,7 +1830,7 @@ void callHistogramKernelLargeNBins(
         }
         for (int step = 0; step < nFullSteps; step++)
         {
-            histo_kernel_mediumNBins<histotype><<<grid, block, medExtShared, CURRENT_STREAM()>>>(
+            histo_kernel_mediumNBins<histotype, nMultires><<<grid, block, 0, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps);
             start += (MEDIUM_BLOCK_SIZE * nblocks * nSteps);
         }
@@ -1732,7 +1838,7 @@ void callHistogramKernelLargeNBins(
         nSteps = size / ( MEDIUM_BLOCK_SIZE * nblocks);
         if (nSteps > 0)
         {
-            histo_kernel_mediumNBins<histotype><<<grid, block, medExtShared, CURRENT_STREAM()>>>(
+            histo_kernel_mediumNBins<histotype, nMultires><<<grid, block, 0, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps);
             start += (MEDIUM_BLOCK_SIZE * nblocks * nSteps);
             size = end - start;
@@ -1742,44 +1848,44 @@ void callHistogramKernelLargeNBins(
             int ntblocks = size / ( MEDIUM_BLOCK_SIZE );
             if (ntblocks * MEDIUM_BLOCK_SIZE < size) ntblocks++;
             grid.x = ntblocks;
-            histo_kernel_mediumNBins<histotype><<<grid, block, medExtShared, CURRENT_STREAM()>>>(
+            histo_kernel_mediumNBins<histotype, nMultires><<<grid, block, 0, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, 1);
         }
     }
     else
-#endif
+#endif // USE_MEDIUM_PATH
     {
         int nFullSteps = 1;
         if (nSteps <= 0)
         {
             nFullSteps = 0;
-            nblocks = (size >> HBLOCK_SIZE_LOG2);
-            if ((nblocks << HBLOCK_SIZE_LOG2) < size) nblocks++;
+            nblocks = (size >> LBLOCK_SIZE_LOG2);
+            if ((nblocks << LBLOCK_SIZE_LOG2) < size) nblocks++;
         }
         if (nSteps > MAX_NLHSTEPS)
         {
-            nFullSteps = size / ( HBLOCK_SIZE * nblocks * MAX_NLHSTEPS);
+            nFullSteps = size / ( LBLOCK_SIZE * nblocks * MAX_NLHSTEPS);
             nSteps = MAX_NLHSTEPS;
         }
         for (int step = 0; step < nFullSteps; step++)
         {
             histo_kernel_largeNBins<histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps, hashSizelog2);
-            start += (HBLOCK_SIZE * nblocks * nSteps);
+            start += (LBLOCK_SIZE * nblocks * nSteps);
         }
         size = end - start;
-        nSteps = size / ( HBLOCK_SIZE * nblocks);
+        nSteps = size / ( LBLOCK_SIZE * nblocks);
         if (nSteps > 0)
         {
             histo_kernel_largeNBins<histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps, hashSizelog2);
-            start += (HBLOCK_SIZE * nblocks * nSteps);
+            start += (LBLOCK_SIZE * nblocks * nSteps);
             size = end - start;
         }
         if (size > 0)
         {
-            int ntblocks = size / ( HBLOCK_SIZE );
-            if (ntblocks * HBLOCK_SIZE < size) ntblocks++;
+            int ntblocks = size / ( LBLOCK_SIZE );
+            if (ntblocks * LBLOCK_SIZE < size) ntblocks++;
             grid.x = ntblocks;
             histo_kernel_largeNBins<histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, 1, hashSizelog2);
@@ -1798,9 +1904,10 @@ void callHistogramKernelLargeNBins(
         cudaMemcpyAsync(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
     else
         cudaMemcpy(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut);
-    grid.x = nOut >> HBLOCK_SIZE_LOG2;
-    if ((grid.x << HBLOCK_SIZE_LOG2) < nOut) grid.x++;
-    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks);
+    grid.x = nOut >> LBLOCK_SIZE_LOG2;
+    if ((grid.x << LBLOCK_SIZE_LOG2) < nOut) grid.x++;
+
+    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks * LBLOCK_WARPS);
     // TODO: Async copy here also???
     if (outInDev && stream != 0)
         cudaMemcpyAsync(out, tmpOut, nOut*sizeof(OUTPUTTYPE), toOut, stream);
@@ -2739,6 +2846,9 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 
 #undef HBLOCK_SIZE_LOG2
 #undef HBLOCK_SIZE
+#undef LBLOCK_SIZE_LOG2
+#undef LBLOCK_SIZE
+#undef LBLOCK_WARPS
 #undef RBLOCK_SIZE
 #undef RMAXSTEPS
 #undef NHSTEPSPERKEY
@@ -2756,6 +2866,12 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 #undef USE_ATOMICS_HASH
 #undef USE_BALLOT_HISTOGRAM
 #undef USE_ATOMIC_ADD
+
+#if USE_MEDIUM_PATH
+#undef MEDIUM_BLOCK_SIZE_LOG2
+#undef MEDIUM_BLOCK_SIZE
+#endif
+#undef USE_MEDIUM_PATH
 
 
 

@@ -5,7 +5,7 @@
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011 Teemu Rantalaiho
+ *  Copyright 2011-2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.

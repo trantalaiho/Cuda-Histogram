@@ -24,9 +24,9 @@
  *
  */
 
-#define TESTMAXIDX   256      // 16 keys / indices
-#define TEST_IS_POW2 1
-#define TEST_SIZE (625 * 1 * 1000 )   // 62.5 million inputs
+#define TESTMAXIDX   256        // default 256 keys (change this) / indices
+#define TEST_IS_POW2 1          // Note: This tells is TESTMAXIDX is power of two number
+#define TEST_SIZE (625 * 100 * 1000 )   // 62.5 million inputs
 #define NRUNS 10          // Repeat 100 times => 100 Gigainputs in total (16 inputs per entry)
 #define START_INDEX	0
 #define NSTRESS_RUNS    NRUNS
@@ -60,7 +60,7 @@ struct test_xform2
   __host__ __device__
   void operator() (uint4* input, int i, int* result_index, int* results, int nresults) const {
     uint4 idata = input[i];
-#pragma unroll
+    #pragma unroll
     for (int resIdx = 0; resIdx < 4; resIdx++)
     {
         unsigned int data = ((unsigned int*)(&idata))[resIdx];
@@ -77,7 +77,7 @@ struct test_xform2
         *result_index++ = ((data >>  0) & 0xFF) % (TESTMAXIDX);
     #endif
     #else
-        *result_index++ = ((data >> 24) /*& 0xFF*/);
+        *result_index++ = ((data >> 24));
         *result_index++ = ((data >> 16) & 0xFF);
         *result_index++ = ((data >>  8) & 0xFF);
         *result_index++ = ((data >>  0) & 0xFF);
@@ -447,7 +447,8 @@ int main (int argc, char** argv)
     }
     {
         double t = cputime_fast() - t0;
-        printf("Runtime in loops: %fs\n", t);
+        double GKps = (((double)TEST_SIZE * (double)NRUNS * 16.0)) / (t*1.e9);
+        printf("Runtime in loops: %fs, Thoughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);

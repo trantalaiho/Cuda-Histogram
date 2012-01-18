@@ -1954,11 +1954,12 @@ static int determineNKeySetsLog2(size_t size_out, int nOut, cudaDeviceProp* prop
     int nBytesShared = 16000;
     size_t sizetot = size_out + sizeof(int);
     int nBinSets = nBytesShared / (sizetot * 2 * nOut);
+// NOTE: Disabling for now - advantages seem nonexistent
 //    if (nBinSets >= 32) return 5;
 //    if (nBinSets >= 16) return 4;
-    if (nBinSets >= 8) return 3;
-    if (nBinSets >= 4) return 2;
-    if (nBinSets >= 2) return 1;
+//    if (nBinSets >= 8) return 3;
+//    if (nBinSets >= 4) return 2;
+//    if (nBinSets >= 2) return 1;
     if (nBinSets >= 1) return 0;
     return -1;
 }
@@ -2059,7 +2060,7 @@ void callHistogramKernelImpl(
       histogramKernel_sharedbins_new<0, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
           input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
       break;
-    case 1:
+/*    case 1:
       histogramKernel_sharedbins_new<1, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
           input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
       break;
@@ -2071,7 +2072,7 @@ void callHistogramKernelImpl(
       histogramKernel_sharedbins_new<3, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
           input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
       break;
-/*    case 4:
+    case 4:
       histogramKernel_sharedbins_new<4, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
           input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
       break;
@@ -2152,8 +2153,42 @@ bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props)
 }
 
 
-/*input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, maxblocks, nSteps)*/
-
+template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+static inline __device__
+void histoKernel_smallBinStep(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    int myStart, int end,
+    OUTPUTTYPE* mySHBins)
+{
+    int myKeys[nMultires];
+    if (lastSteps)
+    {
+        if (myStart < end)
+        {
+            OUTPUTTYPE myOut[nMultires];
+            xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
+#pragma unroll
+            for (int res = 0; res < nMultires; res++)
+            {
+                int index = (myKeys[res]) << SMALL_BLOCK_SIZE_LOG2;
+                mySHBins[index] = sumfunObj(mySHBins[index], myOut[res]);
+            }
+        }
+    }
+    else
+    {
+        OUTPUTTYPE myOut[nMultires];
+        xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
+#pragma unroll
+        for (int res = 0; res < nMultires; res++)
+        {
+            int index = (myKeys[res]) << SMALL_BLOCK_SIZE_LOG2;
+            mySHBins[index] = sumfunObj(mySHBins[index], myOut[res]);
+        }
+    }
+}
 template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
 __global__
 void histoKernel_smallBin(
@@ -2171,52 +2206,27 @@ void histoKernel_smallBin(
     int myStart = start + ((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x;
     for (int bin = 0; bin < nOut /*- nLocVars*/; bin++)
         mySHBins[bin << SMALL_BLOCK_SIZE_LOG2] = zero;
-    // Run loops
-    for (int step = 0; step < nSteps - 1; step++)
+    // Run loops - unroll 8 steps manually
+    int doNSteps = (nSteps) >> 3;
+    for (int step = 0; step < doNSteps; step++)
     {
-        int myKeys[nMultires];
-        if (lastSteps)
-        {
-            if (myStart < end)
-            {
-                OUTPUTTYPE myOut[nMultires];
-                xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
-#pragma unroll
-                for (int res = 0; res < nMultires; res++)
-                {
-                    int index = (myKeys[res]) << SMALL_BLOCK_SIZE_LOG2;
-                    mySHBins[index] = sumfunObj(mySHBins[index], myOut[res]);
-                }
-            }
-        }
-        else
-        {
-            OUTPUTTYPE myOut[nMultires];
-            xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
-#pragma unroll
-            for (int res = 0; res < nMultires; res++)
-            {
-                int index = (myKeys[res]) << SMALL_BLOCK_SIZE_LOG2;
-                mySHBins[index] = sumfunObj(mySHBins[index], myOut[res]);
-            }
-
-        }
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 2*SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 3*SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 4*SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 5*SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 6*SMALL_BLOCK_SIZE, end, mySHBins);
+        histoKernel_smallBinStep<lastSteps, nMultires>(input, xformObj, sumfunObj, myStart + 7*SMALL_BLOCK_SIZE, end, mySHBins);
+        myStart += 8*SMALL_BLOCK_SIZE;
+    }
+    int nStepsLeft = (nSteps) - (doNSteps << 3);
+    for (int step = 0; step < nStepsLeft; step++)
+    {
+        histoKernel_smallBinStep<true, nMultires>(input, xformObj, sumfunObj, myStart, end, mySHBins);
         myStart += SMALL_BLOCK_SIZE;
     }
-    if (myStart < end)
-    {
-        int myKeys[nMultires];
-        OUTPUTTYPE myOut[nMultires];
-        xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
-#pragma unroll
-        for (int res = 0; res < nMultires; res++)
-        {
-            int index = (myKeys[res]) << SMALL_BLOCK_SIZE_LOG2;
-            mySHBins[index] = sumfunObj(mySHBins[index], myOut[res]);
-        }
-    }
     // In the end combine results:
-    // TODO: Optimize this:
 #if SMALL_BLOCK_SIZE > 32
     __syncthreads();
 #endif
@@ -2230,7 +2240,6 @@ void histoKernel_smallBin(
             result = sumfunObj(result, *binResults++);
         }
         ourOut[keyIndex] = result;
-
         keyIndex += SMALL_BLOCK_SIZE;
     }
 }
@@ -2269,6 +2278,53 @@ void intToResult(int resultin, unsigned long long& resultOut){ resultOut = (unsi
 template<typename OUTPUTTYPE>
 static inline __device__
 void intToResult(int resultin, OUTPUTTYPE& resultout){ ; }
+
+
+template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+static inline __device__
+void histoKernel_smallBinByteOneStep(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    int myStart, int end,
+    volatile unsigned char* mySHBins,
+    OUTPUTTYPE zero
+    )
+{
+    if (lastSteps)
+    {
+        if (myStart < end)
+        {
+            OUTPUTTYPE myOut[nMultires];
+            int myKeys[nMultires];
+            xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
+#pragma unroll
+            for (int res = 0; res < nMultires; res++)
+            {
+                // index = tid * 4 + (key / 4) * blockSize * 4 + (key % 4) - mySHBins points to allbins[4 x tid]
+                // Complex indexing cost: 2x bit-shift + bitwise and + addition = 4 ops...
+                int index = (((myKeys[res]) >> 2) << (SMALL_BLOCK_SIZE_LOG2 + 2)) + (myKeys[res] & 0x3);
+                mySHBins[index]++;
+            }
+        }
+    }
+    else /*if (myStart < end)*/
+    {
+        OUTPUTTYPE myOut[nMultires];
+        int myKeys[nMultires];
+        xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
+#pragma unroll
+        for (int res = 0; res < nMultires; res++)
+        {
+            // index = tid * 4 + (key / 4) * blockSize * 4 + (key % 4) - mySHBins points to allbins[4 x tid]
+            // Complex indexing cost: 2x bit-shift + bitwise and + addition = 4 ops...
+            int key = myKeys[res];
+            int index = ((key >> 2) << (SMALL_BLOCK_SIZE_LOG2 + 2)) + (key & 0x3);
+            mySHBins[index]++;
+        }
+    }
+}
+
 
 
 
@@ -2333,6 +2389,7 @@ void histoKernel_smallBinByte(
 #else
     OUTPUTTYPE* resultbins = (OUTPUTTYPE*)(&allbins2[padNOut << SMALL_BLOCK_SIZE_LOG2]);
 #endif
+
     int myStart = start + ((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x;
 
     // Run loops
@@ -2358,47 +2415,58 @@ void histoKernel_smallBinByte(
     __syncthreads();
 #endif
 
-    const int looplim = 255 / nMultires;
+    const int looplim = (255 / nMultires) < 63 ? (255 / nMultires) : 63;
     for (int stepsRem = nSteps; stepsRem > 0; stepsRem -= looplim)
     {
-        int doNSteps = stepsRem > looplim ? looplim : stepsRem;
-
-        for (int step = 0; step < doNSteps; step++)
+        if (stepsRem > looplim)
         {
-            if (lastSteps)
-            {
-                if (myStart < end)
-                {
-                    OUTPUTTYPE myOut[nMultires];
-                    int myKeys[nMultires];
-                    xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
-    #pragma unroll
-                    for (int res = 0; res < nMultires; res++)
-                    {
-                        // index = tid * 4 + (key / 4) * blockSize + (key % 4) - mySHBins points to allbins[4 x tid]
-                        // Complex indexing cost: 2x bit-shift + bitwise and + addition = 4 ops...
-                        int index = (((myKeys[res]) >> 2) << (SMALL_BLOCK_SIZE_LOG2 + 2)) + (myKeys[res] & 0x3);
-                        mySHBins[index]++;
-                    }
-                }
-            }
-            else /*if (myStart < end)*/
-            {
-                OUTPUTTYPE myOut[nMultires];
-                int myKeys[nMultires];
-                xformObj(input, myStart, &myKeys[0], &myOut[0], nMultires);
-    #pragma unroll
-                for (int res = 0; res < nMultires; res++)
-                {
-                    // index = tid * 4 + (key / 4) * blockSize + (key % 4) - mySHBins points to allbins[4 x tid]
-                    // Complex indexing cost: 2x bit-shift + bitwise and + addition = 4 ops...
-                    int key = myKeys[res];
-                    int index = ((key >> 2) << (SMALL_BLOCK_SIZE_LOG2 + 2)) + (key & 0x3);
-                    mySHBins[index]++;
-                }
+#define MANUAL_UNROLL   1
+#if MANUAL_UNROLL
+            // Unroll manually
+            // ("unexcpected control flow" construct with #pragma unroll)
+#define DO_STEP(NUM) do { if ((NUM) < looplim) {                                \
+    histoKernel_smallBinByteOneStep<lastSteps, nMultires>(                      \
+        input, xformObj, sumfunObj, myStart /*+ (NUM) * SMALL_BLOCK_SIZE*/, end,\
+        mySHBins, zero); myStart += SMALL_BLOCK_SIZE;                           \
+    } } while (0)
+#define DO_16_STEPS(N0)  do { \
+    DO_STEP(N0 + 0); DO_STEP(N0 + 1); DO_STEP(N0 + 2); DO_STEP(N0 + 3);         \
+    DO_STEP(N0 + 4); DO_STEP(N0 + 5); DO_STEP(N0 + 6); DO_STEP(N0 + 7);         \
+    DO_STEP(N0 + 8); DO_STEP(N0 + 9); DO_STEP(N0 + 10); DO_STEP(N0 + 11);       \
+    DO_STEP(N0 + 12); DO_STEP(N0 + 13); DO_STEP(N0 + 14); DO_STEP(N0 + 15);     \
+    } while (0)
 
+            DO_16_STEPS(0);
+            DO_16_STEPS(16);
+            DO_16_STEPS(32);
+            DO_16_STEPS(48);
+#undef      DO_16_STEPS
+#undef      DO_STEP
+            //myStart += looplim * SMALL_BLOCK_SIZE;
+#else
+            for (int stepNum = 0; stepNum < looplim; stepNum++){
+              histoKernel_smallBinByteOneStep<lastSteps, nMultires>(
+                input,
+                xformObj,
+                sumfunObj,
+                myStart + stepNum * SMALL_BLOCK_SIZE, end,
+                mySHBins, zero);
             }
-            myStart += SMALL_BLOCK_SIZE;
+            myStart += looplim * SMALL_BLOCK_SIZE;
+#endif // MANUAL_UNROLL
+#undef MANUAL_UNROLL
+        }
+        else
+        {
+            for (int stepNum = 0; stepNum < stepsRem; stepNum++){
+              histoKernel_smallBinByteOneStep<lastSteps, nMultires>(
+                input,
+                xformObj,
+                sumfunObj,
+                myStart + stepNum * SMALL_BLOCK_SIZE, end,
+                mySHBins, zero);
+            }
+            myStart += looplim * SMALL_BLOCK_SIZE;
         }
         // Ok  passes done - need to flush results together
         {
@@ -2414,6 +2482,7 @@ void histoKernel_smallBinByte(
               //int res = (int)allbins2[index];
               int res = resultToInt(resultbins[binid]);
               int ilimit = SMALL_BLOCK_SIZE - threadIdx.x;
+#pragma unroll
               for (int i=0; i < SMALL_BLOCK_SIZE; i++)
               {
                 if (i == ilimit)
@@ -2445,7 +2514,6 @@ void histoKernel_smallBinByte(
         keyIndex += SMALL_BLOCK_SIZE;
     }
 #endif
-
 }
 
 
@@ -2474,7 +2542,7 @@ void callSmallBinHisto(
         return;
     }
 
-    int maxblocks = props->multiProcessorCount * 8;
+    int maxblocks = props->multiProcessorCount * 9;
 
     // TODO: Magic constants..
     // With low bin-counts and large problems it seems beneficial to use
@@ -2551,6 +2619,22 @@ void callSmallBinHisto(
 //        if (error != cudaSuccess)
 //           printf("Cudaerror = %s\n", cudaGetErrorString( error ));
 
+    }
+    size = end - start;
+    if (size > 0)
+    {
+        // Do what steps we still can do without checks
+        nSteps = size / (maxblocks << SMALL_BLOCK_SIZE_LOG2);
+        if (nSteps > 0)
+        {
+            if (histotype == histogram_atomic_inc)
+                histoKernel_smallBinByte<histotype, false, nMultires><<<grid, block, sharedNeeded, stream>>>(
+                    input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, maxblocks, nSteps);
+            else
+                histoKernel_smallBin<false, nMultires><<<grid, block, sharedNeeded, stream>>>(
+                    input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, maxblocks, nSteps);
+            start += nSteps * maxblocks * SMALL_BLOCK_SIZE;
+        }
     }
     size = end - start;
     if (size > 0)
@@ -2767,18 +2851,19 @@ struct histogram_defaultSum
     }
 };
 
-template <typename OUTPUTTYPE>
+template <typename INPUTTYPE, typename OUTPUTTYPE>
 struct histogram_dummyXform
 {
   __host__ __device__
-  void operator() (OUTPUTTYPE* input, int i, int* result_index, OUTPUTTYPE* results, int nresults) const {
+  void operator() (INPUTTYPE* input, int i, int* result_index, OUTPUTTYPE* results, int nresults) const {
       //int idata = input[i];
       int index = i;
+      (void)input;
 #pragma unroll
       for (int resIndex = 0; resIndex < nresults; resIndex++)
       {
         *result_index++ = index++;
-        *results++ = *input++;
+        *results++ = 1;//*input++;
       }
   }
 };
@@ -2808,17 +2893,17 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
     if (cudaErr != 0) return cudaErr;
     int cuda_arch = DetectCudaArch();
     struct histogram_dummySum<int> sumfunObj;
-    struct histogram_dummyXform<int> xformfunObj;
+    struct histogram_dummyXform<uint4, int> xformfunObj;
     if (smallBinLimit<histotype>(nOut, zero, &props, cuda_arch))
     {
         callSmallBinHisto<histotype, 1>(
-            &zero, xformfunObj, sumfunObj, 0, 1,
+            (uint4*)&zero, xformfunObj, sumfunObj, 0, 1,
             zero, out, nOut, &props, cuda_arch, 0, &result, NULL, false);
     }
     else if (!binsFitIntoShared(nOut, zero, &props))
     {
         callHistogramKernelLargeNBins<histotype, 1>(
-            &zero, xformfunObj, sumfunObj, 0, 1, zero, out,
+            (uint4*)&zero, xformfunObj, sumfunObj, 0, 1, zero, out,
             nOut, &props, cuda_arch, 0, &result, NULL, false);
     }
     else
@@ -2834,7 +2919,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
             if (((HBLOCK_SIZE * nsteps) << 5) < size) nsteps++;
         }
         callHistogramKernelImpl<histotype, 1>(
-            &result, xformfunObj, sumfunObj, 0, size, zero, out,
+            (uint4*)&zero, xformfunObj, sumfunObj, 0, size, zero, out,
             nOut, nsteps, &props, 0, &result, NULL, false);
 
     }

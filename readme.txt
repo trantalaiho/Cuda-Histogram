@@ -10,7 +10,7 @@ as template parameters. Therefore the API is C++, but with minimal C++
 features.
 
 What we mean by fast here, is that it wins known histogram algorithms for CUDA
-by as much as 20% to 50% in common use-cases (for example the NVIDIA
+by as much as 40% to 100% in common use-cases (for example the NVIDIA
 Performance Primitives' 1-channel 256-bin histogram - tested on v.4.0.17).
 And what we mean by generic is that it supports arbitrary bin-sizes and types,
 which means that you can basically do any histogram-type of operation that
@@ -91,7 +91,7 @@ Short Usage instructions
         output-values, and the histogram code does the rest.
  - See cuda_histogram.h header "callHistogramKernel()" and
         "getHistogramBufSize()" documentation for details
- - Also check out samples: "test_*.cu", especiall test_minimal.cu
+ - Also check out samples: "test_*.cu", especially test_minimal.cu
 
 
 Known Issues
@@ -108,4 +108,6 @@ Known Issues
  - Large-sized histograms (~2000 bins and more) should be further optimized
  - Compilation time is long (Too many kernels)
  - Code could use some cleaning up (it is still quite fresh out of the oven)
+ - Optimization has been concentrated on Fermi-level hardware. Older hardware
+     is supported, but little work has been done to optimize for it.
 

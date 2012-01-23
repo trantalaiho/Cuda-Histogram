@@ -36,6 +36,8 @@
 
 #ifndef NONPP
 #define ENABLE_NPP      1   // NOTE: In order to link, use: -lnpp -L /usr/local/cuda/lib64/ (or similar)
+#else
+#define ENABLE_NPP      0
 #endif
 
 #ifdef OLDARCH
@@ -72,6 +74,9 @@
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/sort.h>
+#include <thrust/binary_search.h>
+#include <thrust/adjacent_difference.h>
+#include <thrust/inner_product.h>
 #endif
 
 #include <stdio.h>
@@ -225,31 +230,35 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
 // And also that we know before hand the number of indices coming out
 static void testHistogramParamThrust(unsigned char* INPUT, int index_0, int index_1, bool print)
 {
-  test_sumfun2 mysumfun;
-  thrust::equal_to<int> binary_pred;
   int nIndex = TESTMAXIDX;
   int N = index_1 - index_0;
-  thrust::device_vector<int> keys_out(nIndex);
   thrust::device_vector<int> vals_out(nIndex);
-  thrust::device_vector<int> h_vals_out(nIndex);
+  thrust::host_vector<int> h_vals_out(nIndex);
   //thrust::device_vector<int> keys(N);
   thrust::device_ptr<unsigned char> keys(INPUT);
   // Sort the data
   thrust::sort(keys, keys + N);
   // And reduce by key - histogram complete
+#if 0
+  // Note: This codepath is somewhat slow
+  test_sumfun2 mysumfun;
+  thrust::device_vector<int> keys_out(nIndex);
+  thrust::equal_to<int> binary_pred;
   thrust::reduce_by_key(keys, keys + N, thrust::make_constant_iterator(1), keys_out.begin(), vals_out.begin(), binary_pred, mysumfun);
+#else
+  // This is taken from the thrust histogram example
+  thrust::counting_iterator<int> search_begin(0);
+  // Find where are the upper bounds of consecutive keys as indices (ie. partition function)
+  thrust::upper_bound(keys, keys + N,
+                      search_begin, search_begin + nIndex,
+                      vals_out.begin());
+// compute the histogram by taking differences of the partition function (cumulative histogram)
+  thrust::adjacent_difference(vals_out.begin(), vals_out.end(),
+                              vals_out.begin());
+#endif
   h_vals_out = vals_out;
   if (print)
-  {
-    printf("\nThrust results:\n");
-    printf("vals = [ ");
-    for (int i = 0; i < nIndex; i++)
-    {
-        int tmp = h_vals_out[i];
-        printf("(%d), ", tmp);
-    }
-    printf("]\n");
-  }
+      printres(&h_vals_out[0], nIndex, "Thrust results");
 }
 #endif
 
@@ -459,7 +468,8 @@ int main (int argc, char** argv)
     }
     {
         double t = cputime_fast() - t0;
-        printf("Runtime in loops: %fs\n", t);
+        double GKps = (((double)nPixels * (double)NRUNS * 4.0)) / (t*1.e9);
+        printf("Runtime in loops: %fs, Thoughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);

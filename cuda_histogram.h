@@ -146,7 +146,8 @@ callHistogramKernel(
 // Start implementation:
 
 
-
+// Define this to be one to enable cuda Error-checks (runs a tad slower)
+#define H_ERROR_CHECKS      0
 
 #define HBLOCK_SIZE_LOG2    5
 #define HBLOCK_SIZE         (1 << HBLOCK_SIZE_LOG2) // = 32
@@ -1891,9 +1892,11 @@ void callHistogramKernelLargeNBins(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, 1, hashSizelog2);
         }
     }
-    //cudaError_t error = cudaGetLastError();
-    //if (error != cudaSuccess)
-      //printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+      printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#endif
 
     // OK - so now tmpOut contains our gold - we just need to dig it out now
 
@@ -2086,10 +2089,11 @@ void callHistogramKernelImpl(
         break;
   }
 
-  //  cudaError_t error = cudaGetLastError();
-//  if (error != cudaSuccess)
-//    printf("Cudaerror = %s\n", cudaGetErrorString( error ));
-
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#endif
   // OK - so now tmpOut contains our gold - we just need to dig it out now
 
   callMultiReduce(n, nOut, out, tmpOut, sumfunObj, zero, stream, tmpBuffer, outInDev);
@@ -2120,7 +2124,7 @@ void callHistogramKernelImpl(
 
 template <typename OUTTYPE>
 static
-bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props)
+bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props, int cuda_arch)
 {
   // Assume here we can only use 16kb of shared in total per SM
   // Also lets take minimal of 2 threads per functional unit active, in
@@ -2146,7 +2150,8 @@ bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props)
   // ( x + 512 ) * 8bytes = 16000 bytes <=> x = 2000 - 512 = 1488 bins! With better latency-hiding
   // On the other hand this requires atomic operations on the shared memory, which could be somewhat slower on
   // arbitrary types, but all in all, this would seem to provide a better route. At least worth investigating...
-  int limit = 16000;
+  int shlimit = props->sharedMemPerBlock - 300;
+  int limit = cuda_arch < 200 ? shlimit : shlimit / 2;
   if ((nOut + HBLOCK_SIZE) * sizeof(zero) + nOut * sizeof(int) < limit)
     return true;
   return false;
@@ -2542,13 +2547,20 @@ void callSmallBinHisto(
         return;
     }
 
-    int maxblocks = props->multiProcessorCount * 9;
+    int maxblocks = props->multiProcessorCount * 3;
+
+
+    if (size > 2*1024*1024 || getTmpBufSize){
+        maxblocks *= 2;
+        // High occupancy requires lots of blocks
+        if (nOut < 200) maxblocks *= 4;
+    }
 
     // TODO: Magic constants..
     // With low bin-counts and large problems it seems beneficial to use
     // more blocks...
     if (nOut <= 128 || size > 2*4096*4096 || getTmpBufSize)
-        maxblocks *= 2;
+        maxblocks *= 4;
     //printf("maxblocks = %d\n", maxblocks);
 
     OUTPUTTYPE* tmpOut;
@@ -2560,7 +2572,7 @@ void callSmallBinHisto(
         tmpOut = (OUTPUTTYPE*)tmpBuffer;
     else
         cudaMalloc((void**)&tmpOut, (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));
-
+//    cudaMemset(tmpOut, 0, sizeof(OUTPUTTYPE) * nOut * (maxblocks+1));
     {
       #define IBLOCK_SIZE_LOG2    7
       #define IBLOCK_SIZE         (1 << IBLOCK_SIZE_LOG2)
@@ -2580,7 +2592,6 @@ void callSmallBinHisto(
       #undef IBLOCK_SIZE_LOG2
       #undef IBLOCK_SIZE
     }
-
     int sharedNeeded;
     if (histotype == histogram_atomic_inc)
     {
@@ -2615,10 +2626,11 @@ void callSmallBinHisto(
             histoKernel_smallBin<false, nMultires><<<grid, block, sharedNeeded, stream>>>(
                 input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, maxblocks, nSteps);
         start += nSteps * maxblocks * SMALL_BLOCK_SIZE;
-//        cudaError_t error = cudaGetLastError();
-//        if (error != cudaSuccess)
-//           printf("Cudaerror = %s\n", cudaGetErrorString( error ));
-
+#if H_ERROR_CHECKS
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+           printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#endif
     }
     size = end - start;
     if (size > 0)
@@ -2658,11 +2670,12 @@ void callSmallBinHisto(
             histoKernel_smallBin<true, nMultires><<<grid, block, sharedNeeded, stream>>>(
                 input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, maxblocks, nSteps);
     }
-//    cudaError_t error = cudaGetLastError();
-//    if (error != cudaSuccess)
-//       printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+       printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#endif
     // Finally put together the result:
-    //callMultiReduce(maxblocks, nOut, out, tmpOut, sumfunObj, zero);
     enum cudaMemcpyKind fromOut = outInDev ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
     enum cudaMemcpyKind toOut = outInDev ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
     if (stream != 0)
@@ -2794,7 +2807,7 @@ callHistogramKernel(
     {
         callSmallBinHisto<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut, &props, cuda_arch, stream, NULL, tmpBuffer, outInDev);
     }
-    else if (!binsFitIntoShared(nOut, zero, &props))
+    else if (!binsFitIntoShared(nOut, zero, &props, cuda_arch))
     {
         callHistogramKernelLargeNBins<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut, &props, cuda_arch, stream, NULL, tmpBuffer, outInDev);
     }
@@ -2802,7 +2815,8 @@ callHistogramKernel(
     {
         int nsteps = nOut * NHSTEPSPERKEY;
         if (nsteps > MAX_NHSTEPS) nsteps = MAX_NHSTEPS;
-        int max = HBLOCK_SIZE * 4096 * nsteps;
+        // TODO: Silly magic number
+        int max = HBLOCK_SIZE * 1024 * nsteps;
         bool done = false;
         for (int i0 = start; !done; i0 += max)
         {
@@ -2814,10 +2828,10 @@ callHistogramKernel(
                 int size = i1 - i0;
                 int nblocks = size / (HBLOCK_SIZE * nsteps);
                 if (HBLOCK_SIZE * nblocks * nsteps < size) nblocks++;
-                if (nblocks < 32 && nsteps > 1)
+                if (nblocks < props.multiProcessorCount * 8 && nsteps > 1)
                 {
-                    nsteps = size >> (HBLOCK_SIZE_LOG2 + 5);
-                    if (((HBLOCK_SIZE * nsteps) << 5) < size) nsteps++;
+                    nsteps = size / (HBLOCK_SIZE * props.multiProcessorCount * 8);
+                    if (((HBLOCK_SIZE * nsteps * props.multiProcessorCount * 8)) < size) nsteps++;
                 }
             }
         callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, i0, i1, zero, out, nOut, nsteps, &props, stream, NULL, tmpBuffer, outInDev);
@@ -2900,7 +2914,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
             (uint4*)&zero, xformfunObj, sumfunObj, 0, 1,
             zero, out, nOut, &props, cuda_arch, 0, &result, NULL, false);
     }
-    else if (!binsFitIntoShared(nOut, zero, &props))
+    else if (!binsFitIntoShared(nOut, zero, &props, cuda_arch))
     {
         callHistogramKernelLargeNBins<histotype, 1>(
             (uint4*)&zero, xformfunObj, sumfunObj, 0, 1, zero, out,
@@ -2910,13 +2924,13 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
     {
         int nsteps = nOut * NHSTEPSPERKEY;
         if (nsteps > MAX_NHSTEPS) nsteps = MAX_NHSTEPS;
-        int size = HBLOCK_SIZE * 4096 * nsteps;
+        int size = HBLOCK_SIZE * 1024 * nsteps;
         int nblocks = size / (HBLOCK_SIZE * nsteps);
         if (HBLOCK_SIZE * nblocks * nsteps < size) nblocks++;
-        if (nblocks < 32 && nsteps > 1)
+        if (nblocks < props.multiProcessorCount * 8 && nsteps > 1)
         {
-            nsteps = size >> (HBLOCK_SIZE_LOG2 + 5);
-            if (((HBLOCK_SIZE * nsteps) << 5) < size) nsteps++;
+            nsteps = size / (HBLOCK_SIZE * props.multiProcessorCount * 8);
+            if (((HBLOCK_SIZE * nsteps * props.multiProcessorCount * 8)) < size) nsteps++;
         }
         callHistogramKernelImpl<histotype, 1>(
             (uint4*)&zero, xformfunObj, sumfunObj, 0, size, zero, out,
@@ -2929,6 +2943,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 
 // undef everything
 
+#undef H_ERROR_CHECKS
 #undef HBLOCK_SIZE_LOG2
 #undef HBLOCK_SIZE
 #undef LBLOCK_SIZE_LOG2

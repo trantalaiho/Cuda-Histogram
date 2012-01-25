@@ -337,15 +337,6 @@ static void fillInput(float* input, bool load, bool rnd)
   if (texData) free(texData);
 }
 
-#include <sys/time.h>
-
-static double cputime_fast()
-{
-  struct timeval resource;
-  gettimeofday(&resource,NULL);
-  return( resource.tv_sec + 1.0e-6*resource.tv_usec );
-}
-
 
 int main (int argc, char** argv)
 {
@@ -362,8 +353,6 @@ int main (int argc, char** argv)
 //  bool sharp = false;
   bool rnd = false;
   bool load = false;
-
-  double t0;
 
   printUsage();
 
@@ -398,8 +387,13 @@ int main (int argc, char** argv)
       assert(INPUT);
       cudaMemcpy(INPUT, hostINPUT, sizeof(float) * TEST_SIZE, cudaMemcpyHostToDevice);
     }
-    // Now start timer:
-    t0 = cputime_fast();
+    // Create events for timing:
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Now start timer - we run on stream 0 (default stream):
+    cudaEventRecord(start, 0);
 
     for (i = 0; i < NRUNS; i++)
     {
@@ -421,11 +415,18 @@ int main (int argc, char** argv)
       if (stress) break;
     }
     {
-        double t = cputime_fast() - t0;
-        printf("Runtime in loops: %fs\n", t);
+      float t_ms;
+      cudaEventRecord(stop, 0);
+      cudaThreadSynchronize();
+      cudaEventElapsedTime(&t_ms, start, stop);
+      double t = t_ms * 0.001f;
+      double GKps = (((double)TEST_SIZE * (double)NRUNS)) / (t*1.e9);
+      printf("Runtime in loops: %fs, Throughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
   }
   return 0;
 }

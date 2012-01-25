@@ -24,17 +24,15 @@
  *
  */
 
-#define TESTMAXIDX   16384     // 16 keys / indices
+#define TESTMAXIDX   512     // 16 keys / indices
 #define TEST_IS_POW2 1
-#define TEST_SIZE (25 * 1000 * 1000 )   // 25 million inputs
-#define NRUNS 100          // Repeat 100 times => 10 Gigainputs in total (4 inputs per entry)
+#define TEST_SIZE (25 * 1000 * 1000 )   // 25 million inputs (100 million keys)
+#define NRUNS 100          // Repeat 100 times => 10 Gigainputs in total (4 keys per entry)
 #define START_INDEX	0
 #define NSTRESS_RUNS    NRUNS
 
 #ifdef THRUST
 #define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-#else
-#define ENABLE_THRUST   0
 #endif
 
 #include "cuda_histogram.h"
@@ -345,15 +343,6 @@ static void fillInput(int* input, bool load, bool rnd)
   if (texData) free(texData);
 }
 
-#include <sys/time.h>
-
-static double cputime_fast()
-{
-  struct timeval resource;
-  gettimeofday(&resource,NULL);
-  return( resource.tv_sec + 1.0e-6*resource.tv_usec );
-}
-
 
 int main (int argc, char** argv)
 {
@@ -372,7 +361,6 @@ int main (int argc, char** argv)
   bool load = false;
 
   void* tmpbuf = NULL;
-  double t0;
 
   printUsage();
 
@@ -409,8 +397,13 @@ int main (int argc, char** argv)
       int tmpbufSize = getHistogramBufSize<histogram_atomic_inc>(0, TESTMAXIDX);
       cudaMalloc(&tmpbuf, tmpbufSize);
     }
-    // Now start timer:
-    t0 = cputime_fast();
+    // Create events for timing:
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    // Now start timer - we run on stream 0 (default stream):
+    cudaEventRecord(start, 0);
 
     for (i = 0; i < NRUNS; i++)
     {
@@ -432,12 +425,19 @@ int main (int argc, char** argv)
       if (stress) break;
     }
     {
-        double t = cputime_fast() - t0;
-        printf("Runtime in loops: %fs\n", t);
+        float t_ms;
+        cudaEventRecord(stop, 0);
+        cudaThreadSynchronize();
+        cudaEventElapsedTime(&t_ms, start, stop);
+        double t = t_ms * 0.001f;
+        double GKps = (((double)TEST_SIZE * (double)NRUNS * 4.0)) / (t*1.e9);
+        printf("Runtime in loops: %fs, Throughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (tmpbuf) cudaFree(tmpbuf);
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
   }
   return 0;
 }

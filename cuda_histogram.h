@@ -171,6 +171,9 @@ callHistogramKernel(
 #define MAX_NHSTEPS         1024
 #define MAX_NLHSTEPS        2048
 
+#define GATHER_BLOCK_SIZE_LOG2  6
+#define GATHER_BLOCK_SIZE       (1 << GATHER_BLOCK_SIZE_LOG2)
+
 #define STRATEGY_CHECK_INTERVAL_LOG2    7
 #define STRATEGY_CHECK_INTERVAL         (1 << STRATEGY_CHECK_INTERVAL_LOG2)
 
@@ -369,20 +372,75 @@ void callMultiReduce(
 
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 __global__
-void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int maxblocks)
+void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEntries)
 {
-    int resIdx = threadIdx.x + blockDim.x * blockIdx.x;
-    while (resIdx < nOut)
+    //int resIdx = threadIdx.x + blockDim.x * blockIdx.x;
+    int resIdx = blockIdx.x;
+    if (resIdx < nOut)
     {
-        OUTPUTTYPE res = blockOut[resIdx + nOut * maxblocks];
-        for (int i = 0; i < maxblocks; i++)
-        {
-          res = sumfunObj(res, blockOut[i * nOut + resIdx]);
-        }
-        blockOut[resIdx] = res;
-        resIdx += blockDim.x * gridDim.x;
-    }
+        // Let's divide the nEntries first evenly on all threads and read 4 entries in a row
+        int locEntries = (nEntries) >> (GATHER_BLOCK_SIZE_LOG2);
 
+        // Note: Original array entry is stored in resIdx + nOut * nEntries!
+        OUTPUTTYPE res = blockOut[resIdx + nOut * nEntries];
+
+        // Shift starting ptr:
+        blockOut = &blockOut[resIdx];
+        int locIdx = threadIdx.x * locEntries;
+        for (int i=0; i < locEntries/4; i++)
+        {
+
+          OUTPUTTYPE x1 = blockOut[nOut * (locIdx + (i << 2))];
+          OUTPUTTYPE x2 = blockOut[nOut * (locIdx + (i << 2) + 1)];
+          OUTPUTTYPE x3 = blockOut[nOut * (locIdx + (i << 2) + 2)];
+          OUTPUTTYPE x4 = blockOut[nOut * (locIdx + (i << 2) + 3)];
+          res = sumfunObj(res, x1);
+          res = sumfunObj(res, x2);
+          res = sumfunObj(res, x3);
+          res = sumfunObj(res, x4);
+        }
+        // Then do the rest
+        for (int j = (locEntries/4)*4; j < locEntries; j++)
+        {
+          OUTPUTTYPE x1 = blockOut[nOut * (locIdx + j)];
+          res = sumfunObj(res, x1);
+        }
+        // Still handle rest starting from index "locEntries * BLOCK_SIZE":
+        locIdx = threadIdx.x + (locEntries << GATHER_BLOCK_SIZE_LOG2);
+        if (locIdx < nEntries)
+          res = sumfunObj(res, blockOut[nOut * locIdx]);
+        // Ok - all that is left is to do the final parallel reduction between threads:
+        {
+            __shared__  OUTPUTTYPE data[GATHER_BLOCK_SIZE];
+            data[threadIdx.x] = res;
+        #if GATHER_BLOCK_SIZE == 512
+            __syncthreads();
+            if (threadIdx.x < 256)
+              data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 256]);
+        #endif
+#if GATHER_BLOCK_SIZE >= 256
+          __syncthreads();
+          if (threadIdx.x < 128)
+            data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 128]);
+#endif
+#if GATHER_BLOCK_SIZE >= 128
+          __syncthreads();
+          if (threadIdx.x < 64)
+            data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 64]);
+          __syncthreads();
+#endif
+#if GATHER_BLOCK_SIZE >= 64
+          __syncthreads();
+          if (threadIdx.x < 32)
+            data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 32]);
+#endif
+          if (threadIdx.x < 16) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 16]);
+          if (threadIdx.x < 8) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 8]);
+          if (threadIdx.x < 4) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 4]);
+          if (threadIdx.x < 2) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 2]);
+          if (threadIdx.x < 1) *blockOut = sumfunObj(data[threadIdx.x], data[threadIdx.x + 1]);
+        }
+    }
 }
 
 
@@ -1746,7 +1804,7 @@ void callHistogramKernelLargeNBins(
       if (getTmpBufSize) getTmpBufSize = 0;
         return;
     }
-    const dim3 block = LBLOCK_SIZE;
+    dim3 block = LBLOCK_SIZE;
     dim3 grid = nblocks;
     int nSteps = size / ( LBLOCK_SIZE * nblocks);
     OUTPUTTYPE* tmpOut;
@@ -1907,9 +1965,10 @@ void callHistogramKernelLargeNBins(
         cudaMemcpyAsync(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
     else
         cudaMemcpy(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut);
-    grid.x = nOut >> LBLOCK_SIZE_LOG2;
-    if ((grid.x << LBLOCK_SIZE_LOG2) < nOut) grid.x++;
-
+    grid.x = nOut;
+    //grid.x = nOut >> LBLOCK_SIZE_LOG2;
+    //if ((grid.x << LBLOCK_SIZE_LOG2) < nOut) grid.x++;
+    block.x = GATHER_BLOCK_SIZE;
     gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks * LBLOCK_WARPS);
     // TODO: Async copy here also???
     if (outInDev && stream != 0)
@@ -2682,8 +2741,11 @@ void callSmallBinHisto(
         cudaMemcpyAsync(&tmpOut[maxblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
     else
         cudaMemcpy(&tmpOut[maxblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut);
-    grid.x = nOut >> SMALL_BLOCK_SIZE_LOG2;
-    if ((grid.x << SMALL_BLOCK_SIZE_LOG2) < nOut) grid.x++;
+    // Let's do so that one block handles one bin
+    grid.x = nOut;
+    //grid.x = nOut >> SMALL_BLOCK_SIZE_LOG2;
+    //if ((grid.x << SMALL_BLOCK_SIZE_LOG2) < nOut) grid.x++;
+    block.x = GATHER_BLOCK_SIZE;
     gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, maxblocks);
     // TODO: Use async copy for the results as well?
     if (outInDev && stream != 0)
@@ -2948,6 +3010,8 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 #undef HBLOCK_SIZE
 #undef LBLOCK_SIZE_LOG2
 #undef LBLOCK_SIZE
+#undef GATHER_BLOCK_SIZE_LOG2
+#undef GATHER_BLOCK_SIZE
 #undef LBLOCK_WARPS
 #undef RBLOCK_SIZE
 #undef RMAXSTEPS

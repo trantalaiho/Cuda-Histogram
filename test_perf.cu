@@ -302,15 +302,15 @@ static void testHistogramParamThrust(int* INPUT, int index_0, int index_1, bool 
 void printUsage(void)
 {
   printf("\n");
-  printf("Test order independent reduce-by-key / histogram algorithm\n\n");
-  printf("By default this runs on custom algorithm on the GPU, with lots of equal consecutive keys\n\n");
-  printf("\tOptions:\n\n");
-  printf("\t\t--cpu\t\t Run on CPU serially instead of GPU\n");
-  printf("\t\t--print\t\t Print results of algorithm (check validity)\n");
-  printf("\t\t--thrust\t Run on GPU but using thrust library\n");
+  printf("# Test order independent reduce-by-key / histogram algorithm\n#\n");
+  printf("# By default this runs on custom algorithm on the GPU, with lots of equal consecutive keys\n#\n");
+  printf("# \tOptions:\n#\n");
+  printf("# \t\t--cpu\t\t Run on CPU serially instead of GPU\n");
+  printf("# \t\t--print\t\t Print results of algorithm (check validity)\n");
+  printf("# \t\t--thrust\t Run on GPU but using thrust library\n");
 
-  printf("\t\t--load\t Use 32-bit texture data s\n");
-  printf("\t\t--rnd\t Take uniform random keys s\n");
+  printf("# \t\t--load\t Use 32-bit texture data s\n");
+  printf("# \t\t--rnd\t Take uniform random keys s\n");
 }
 
 
@@ -478,28 +478,19 @@ void printGPUData(void)
     // Print important and interesting properties:
     {
         const char* compMode = compModeToString(props.computeMode);
-        printf("Running on device %d: %s\n",devId,props.name);
-        printf("CUDA-Architecture version: %d.%d\t", props.major, props.minor);
-        printf("Tot. global mem  = %lu\t", (unsigned long)props.totalGlobalMem);
-        printf("Tot. const mem  = %lu\n", (unsigned long)props.totalConstMem);
-        printf("Num sms = %d\t", props.multiProcessorCount);
-        printf("Regs / sm (block) = %d\t", props.regsPerBlock);
-        printf("shared mem / sm(block) = %lu\t", (unsigned long)props.sharedMemPerBlock);
-        printf("ClockRate  = %d\n", props.clockRate);
-        printf("ECC Enabled = %d\t", props.ECCEnabled);
-        printf("Overlap kernels = %d\t", props.concurrentKernels);
-        printf("Overlap mem xfer = %d\n", props.deviceOverlap);
-        printf("Computemode = %s\n", compMode);
+        printf("# Running on device %d: %s\n",devId,props.name);
+        printf("# CUDA-Architecture version: %d.%d\t", props.major, props.minor);
+        printf("# Tot. global mem  = %lu\t", (unsigned long)props.totalGlobalMem);
+        printf("# Tot. const mem  = %lu\n", (unsigned long)props.totalConstMem);
+        printf("# Num sms = %d\t", props.multiProcessorCount);
+        printf("# Regs / sm (block) = %d\t", props.regsPerBlock);
+        printf("# shared mem / sm(block) = %lu\t", (unsigned long)props.sharedMemPerBlock);
+        printf("# ClockRate  = %d\n", props.clockRate);
+        printf("# ECC Enabled = %d\t", props.ECCEnabled);
+        printf("# Overlap kernels = %d\t", props.concurrentKernels);
+        printf("# Overlap mem xfer = %d\n", props.deviceOverlap);
+        printf("# Computemode = %s\n", compMode);
     }
-}
-
-#include <sys/time.h>
-
-static double cputime_fast()
-{
-  struct timeval resource;
-  gettimeofday(&resource,NULL);
-  return( resource.tv_sec + 1.0e-6*resource.tv_usec );
 }
 
 
@@ -515,8 +506,6 @@ int main (int argc, char** argv)
 
   bool rnd = false;
   bool load = false;
-
-  double t0;
 
   printUsage();
 
@@ -545,6 +534,11 @@ int main (int argc, char** argv)
       // Ok CUDA is up - print out info on chosen GPU:
       printGPUData();
     }
+    // Create events for timing:
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     for (int test=0; test < sizeof(checkNBins) / sizeof(checkNBins[0]); test++)
     {
         int nIndices = checkNBins[test];
@@ -555,8 +549,8 @@ int main (int argc, char** argv)
         int zero = 0;
         int tmpbufsize = getHistogramBufSize<histogram_atomic_inc>(zero , nIndices);
         cudaMalloc(&tmpBuffer, tmpbufsize);
-        // Now start timer:
-        t0 = cputime_fast();
+        // Now start timer - we run on stream 0 (default stream):
+        cudaEventRecord(start, 0);
         if (thrust)
         {
           #if ENABLE_THRUST
@@ -571,18 +565,22 @@ int main (int argc, char** argv)
           testHistogramParam((uint4*)INPUT, (uint4*)hostINPUT, index_0, index_1, print, cpu, tmpBuffer, nIndices);
         }
         {
-            double t = cputime_fast() - t0;
+            float t_ms;
+            cudaEventRecord(stop, 0);
+            cudaThreadSynchronize();
+            cudaEventElapsedTime(&t_ms, start, stop);
+            double t = t_ms * 0.001f;
             int nKeys = TEST_SIZE*4;
             if (nIndices <= 256) nKeys *= 4;
             double GKeys = ((double)nKeys)*1.e-9;
-            double GKps = ((double)NRUNS) * GKeys / t;
+            double GKps = ((double)NRUNS) * GKeys / (double)t;
             double GBps = nIndices > 256 ? GKps * 4.0 : GKps;
             if (test == 0){
-                printf("Nbins <= 256: N keys/run = %.2f MKeys, runs = %d, tot keys = %.2f MKeys\n",
+                printf("# Nbins <= 256: N keys/run = %.2f MKeys, runs = %d, tot keys = %.2f MKeys\n",
                         GKeys*1000.0, NRUNS, GKeys*((double)NRUNS)*1000.0);
-                printf("Nbins > 256: N keys/run = %.2f MKeys, runs = %d, tot keys = %.2f MKeys\n",
+                printf("# Nbins > 256: N keys/run = %.2f MKeys, runs = %d, tot keys = %.2f MKeys\n",
                         GKeys*250.0, NRUNS, GKeys*((double)NRUNS)*250.0);
-                printf("Number of bins, Runtime in loops: (s), Throughput (Gkeys/s), Throughput (GB/s)\n");
+                printf("# Number of bins, Runtime in loops: (s), Throughput (Gkeys/s), Throughput (GB/s)\n");
             }
             printf("%d,\t\t%4f,\t\t%4f,\t\t%4f,\n", nIndices, t, GKps, GBps);
         }
@@ -590,7 +588,8 @@ int main (int argc, char** argv)
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
-
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
   }
   return 0;
 }

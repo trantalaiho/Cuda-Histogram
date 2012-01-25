@@ -49,16 +49,11 @@
 
 #if ENABLE_NPP
 #include <npp.h>
-
-/*#include <ImagesCPU.h>
-#include <ImagesNPP.h>
-#include <ImageIO.h>
-#include <Exceptions.h>
-*/
-#include <string>
-#include <assert.h>
-#include <iostream>
 #endif
+
+#include <string>
+#include <iostream>
+#include <assert.h>
 
 #include "cuda_histogram.h"
 /*#include <cuda_runtime_api.h>
@@ -326,16 +321,6 @@ static void fillInput(int* input, const char* filename, int nPixels)
   }
 }
 
-#include <sys/time.h>
-#include <sys/stat.h>
-
-
-static double cputime_fast()
-{
-  struct timeval resource;
-  gettimeofday(&resource,NULL);
-  return( resource.tv_sec + 1.0e-6*resource.tv_usec );
-}
 
 
 int main (int argc, char** argv)
@@ -348,8 +333,6 @@ int main (int argc, char** argv)
   bool npp = false;
 
   const char* name = "feli.raw";
-
-  double t0;
 
   printUsage();
 
@@ -376,11 +359,18 @@ int main (int argc, char** argv)
 
     int nPixels = 0;
     {
-      struct stat fileStat;
-      int error = stat(name, &fileStat);
+      // Portable way to check filesize with C-apis:
+      FILE* file = fopen(name, "rb");
+      int error = -1;
+      long filesize = 0;
+      if (file)
+        error = fseek(file, 0, SEEK_END);
       if (error == 0)
       {
-        nPixels = (int)((fileStat.st_size / 12) << 2);
+        filesize = ftell(file);
+        printf("File: %s, filesize = %ld\n", name, filesize);
+        fclose(file);
+        nPixels = (int)((filesize / 12) << 2);
         if (nPixels <= 0)
         {
           printf("Filesize is too large or small...Sorry...\n");
@@ -389,7 +379,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        printf("Can't access file: %s, errorcode = %d (man stat)\n", name, error);
+        printf("Can't access file: %s, errorcode = %d (man fseek)\n", name, error);
         return error;
       }
     }
@@ -414,6 +404,11 @@ int main (int argc, char** argv)
       cudaMalloc(&nppResBuffer, sizeof(int) * TESTMAXIDX);
       cudaMemset(nppResBuffer, 0, sizeof(int) * TESTMAXIDX);
     }
+    // Create events for timing:
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
     if (npp)
     {
       #if (ENABLE_NPP == 0)
@@ -445,8 +440,8 @@ int main (int argc, char** argv)
         cudaMalloc(&nppBuffer, tmpbufsize);
     }
 
-    // Now start timer:
-    t0 = cputime_fast();
+    // Now start timer - we run on stream 0 (default stream):
+    cudaEventRecord(start, 0);
 
     for (i = 0; i < NRUNS; i++)
     {
@@ -467,13 +462,19 @@ int main (int argc, char** argv)
       // Run only once all stress-tests
     }
     {
-        double t = cputime_fast() - t0;
+        float t_ms;
+        cudaEventRecord(stop, 0);
+        cudaThreadSynchronize();
+        cudaEventElapsedTime(&t_ms, start, stop);
+        double t = t_ms * 0.001f;
         double GKps = (((double)nPixels * (double)NRUNS * 4.0)) / (t*1.e9);
         printf("Runtime in loops: %fs, Thoughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
     if (nppBuffer) cudaFree(nppBuffer);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
   }
   return 0;
 }

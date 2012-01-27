@@ -2552,12 +2552,23 @@ void histoKernel_smallBinByte(
                 if (i == ilimit)
                   index -= (SMALL_BLOCK_SIZE << 2);
                 res += allbins2[index];
-                allbins2[index] = 0;
+                //allbins2[index] = 0;
                 index += 4;
               }
               intToResult(res, resultbins[binid]);
               binid += SMALL_BLOCK_SIZE;
             }
+#       if SMALL_BLOCK_SIZE > 32
+        __syncthreads();
+#       endif
+            // zero the bins
+            {
+            int* tmpSHBins = &((int*)allbins2)[threadIdx.x];
+            // There are nOut x BLOCK_SIZE byte-sized bins so nOut x BLOCKISIZE/4 int-sized ones
+            for (int bin = 0; bin < (padNOut >> 2) /*- nLocVars*/; bin++)
+              tmpSHBins[bin << (SMALL_BLOCK_SIZE_LOG2)] = 0;
+            }
+
 #       if SMALL_BLOCK_SIZE > 32
         __syncthreads();
 #       endif

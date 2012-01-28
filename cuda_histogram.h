@@ -372,7 +372,7 @@ void callMultiReduce(
 
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 __global__
-void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEntries)
+void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEntries, OUTPUTTYPE zero)
 {
     //int resIdx = threadIdx.x + blockDim.x * blockIdx.x;
     int resIdx = blockIdx.x;
@@ -382,7 +382,9 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
         int locEntries = (nEntries) >> (GATHER_BLOCK_SIZE_LOG2);
 
         // Note: Original array entry is stored in resIdx + nOut * nEntries!
-        OUTPUTTYPE res = blockOut[resIdx + nOut * nEntries];
+        OUTPUTTYPE res = zero;
+        if (threadIdx.x == 0)
+            res = blockOut[resIdx + nOut * nEntries];
 
         // Shift starting ptr:
         blockOut = &blockOut[resIdx];
@@ -412,6 +414,11 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
         // Ok - all that is left is to do the final parallel reduction between threads:
         {
             __shared__  OUTPUTTYPE data[GATHER_BLOCK_SIZE];
+            //volatile OUTPUTTYPE* data = (volatile OUTPUTTYPE*)&dataTmp[0];
+            // TODO Compiler complains with volatile from this - why?
+            //error: no operator "=" matches these operands
+              //         operand types are: volatile myTestType_s = myTestType
+            // Silly - does not happen with built-in types (nice...)
             data[threadIdx.x] = res;
         #if GATHER_BLOCK_SIZE == 512
             __syncthreads();
@@ -434,10 +441,15 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
           if (threadIdx.x < 32)
             data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 32]);
 #endif
+          __syncthreads();
           if (threadIdx.x < 16) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 16]);
+          __syncthreads();
           if (threadIdx.x < 8) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 8]);
+          __syncthreads();
           if (threadIdx.x < 4) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 4]);
+          __syncthreads();
           if (threadIdx.x < 2) data[threadIdx.x] = sumfunObj(data[threadIdx.x], data[threadIdx.x + 2]);
+          __syncthreads();
           if (threadIdx.x < 1) *blockOut = sumfunObj(data[threadIdx.x], data[threadIdx.x + 1]);
         }
     }
@@ -1969,7 +1981,7 @@ void callHistogramKernelLargeNBins(
     //grid.x = nOut >> LBLOCK_SIZE_LOG2;
     //if ((grid.x << LBLOCK_SIZE_LOG2) < nOut) grid.x++;
     block.x = GATHER_BLOCK_SIZE;
-    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks * LBLOCK_WARPS);
+    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks * LBLOCK_WARPS, zero);
     // TODO: Async copy here also???
     if (outInDev && stream != 0)
         cudaMemcpyAsync(out, tmpOut, nOut*sizeof(OUTPUTTYPE), toOut, stream);
@@ -2757,7 +2769,7 @@ void callSmallBinHisto(
     //grid.x = nOut >> SMALL_BLOCK_SIZE_LOG2;
     //if ((grid.x << SMALL_BLOCK_SIZE_LOG2) < nOut) grid.x++;
     block.x = GATHER_BLOCK_SIZE;
-    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, maxblocks);
+    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, maxblocks, zero);
     // TODO: Use async copy for the results as well?
     if (outInDev && stream != 0)
         cudaMemcpyAsync(out, tmpOut, nOut*sizeof(OUTPUTTYPE), toOut, stream);

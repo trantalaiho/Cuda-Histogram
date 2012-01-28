@@ -125,7 +125,7 @@ static void printres (int* res, int nres, const char* descr)
     printf("]\n");
 }
 
-static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, bool cpurun, bool stress)
+static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, bool cpurun, bool stress, bool fastCheck)
 {
   int nIndex = INPUT;
   int srun;
@@ -134,7 +134,7 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
   test_xform2 transformFun;
   //test_indexfun2 indexFun;
   int* tmpres = (int*)malloc(sizeof(int) * nIndex);
-  int* cpures = stress ? (int*)malloc(sizeof(int) * nIndex) : tmpres;
+  int* cpures = (stress && !fastCheck) ? (int*)malloc(sizeof(int) * nIndex) : tmpres;
   int zero = 0;
   for (srun = 0; srun < nruns; srun++)
   {
@@ -142,9 +142,9 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
       if (print)
         printf("\nTest reduce_by_key:\n\n");
       memset(tmpres, 0, sizeof(int) * nIndex);
-      if (stress)
+      if (stress && !fastCheck)
           memset(cpures, 0, sizeof(int) * nIndex);
-      if (cpurun || stress)
+      if (cpurun || (stress  && !fastCheck))
         for (int i = index_0; i < index_1; i++)
         {
           int index;
@@ -166,15 +166,28 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
 
     if (stress)
     {
-        int k;
-        for (k = 0; k < nIndex; k++)
+        if (fastCheck)
         {
-            if (tmpres[k] != cpures[k])
+            int sum = 0;
+            for (int k = 0; k < nIndex; k++)
+                sum +=tmpres[k];
+            if (sum != (index_1 - index_0))
             {
                 printf("Error detected with index-values: i0 = %d, i1 = %d, nbins = %d!\n", index_0, index_1, nIndex);
-                printres(cpures, nIndex, "CPU results:");
-                printres(tmpres, nIndex, "GPU results:");
                 return false;
+            }
+        }
+        else
+        {
+            for (int k = 0; k < nIndex; k++)
+            {
+                if (tmpres[k] != cpures[k])
+                {
+                    printf("Error detected with index-values: i0 = %d, i1 = %d, nbins = %d!\n", index_0, index_1, nIndex);
+                    printres(cpures, nIndex, "CPU results:");
+                    printres(tmpres, nIndex, "GPU results:");
+                    return false;
+                }
             }
         }
     }
@@ -194,7 +207,7 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
     }
   }
   free(tmpres);
-  if (stress)
+  if (stress && !fastCheck)
     free(cpures);
   return true;
 }
@@ -269,6 +282,7 @@ void printUsage(void)
   printf("\t\t--cpu\t\t Run on CPU serially instead of GPU\n");
   printf("\t\t--print\t\t Print results of algorithm (check validity)\n");
   printf("\t\t--thrust\t Run on GPU but using thrust library\n");
+  printf("\t\t--fast\t Run just checksum to compare\n");
 }
 
 int main (int argc, char** argv)
@@ -282,6 +296,7 @@ int main (int argc, char** argv)
   bool print = false;
   bool thrust = false;
   bool stress = false;
+  bool fast = false;
 
   printUsage();
 
@@ -295,6 +310,9 @@ int main (int argc, char** argv)
       cpu = true;
     if (argv[i] && strcmp(argv[i], "--thrust") == 0)
       thrust = true;
+    if (argv[i] && strcmp(argv[i], "--fast") == 0)
+      fast = true;
+
   }
   for (INPUT = START_NBINS; INPUT < TESTMAXIDX; INPUT+=NBIN_INC)
   {
@@ -311,7 +329,7 @@ int main (int argc, char** argv)
         }
         else
         {
-          bool success = testHistogramParam(INPUT, index_0, index_1, print, cpu, stress);
+          bool success = testHistogramParam(INPUT, index_0, index_1, print, cpu, stress, fast);
           if (!success) return 1;
         }
         print = false;

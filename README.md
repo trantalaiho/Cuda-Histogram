@@ -1,8 +1,7 @@
  Generalized CUDA-histogram v0.1 README
 ----------------------------------------
 
-Copyright Teemu Rantalaiho 2011 - 2012
-Email: "firstname"."lastname"@helsinki.fi
+Copyright Teemu Rantalaiho 2011-2012 - Email: "firstname"."lastname"@helsinki.fi
 
 This file contains a quick introduction, as well as quick instructions on how to
 use our generalized histogram code for CUDA-capable GPUs. The code is fast and

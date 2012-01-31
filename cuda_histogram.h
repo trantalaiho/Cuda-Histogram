@@ -27,8 +27,6 @@
 #define CUDA_HISTOGRAM_H_
 
 #include <cuda_runtime_api.h>
-//#include <assert.h>
-//#include <stdio.h>
 
 
 // Public API:
@@ -148,6 +146,11 @@ callHistogramKernel(
 
 // Define this to be one to enable cuda Error-checks (runs a tad slower)
 #define H_ERROR_CHECKS      0
+
+#if H_ERROR_CHECKS
+    #include <assert.h>
+    #include <stdio.h>
+#endif
 
 #define HBLOCK_SIZE_LOG2    5
 #define HBLOCK_SIZE         (1 << HBLOCK_SIZE_LOG2) // = 32

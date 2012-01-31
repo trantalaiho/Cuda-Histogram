@@ -1,7 +1,8 @@
  Generalized CUDA-histogram v0.1 README
 ----------------------------------------
 
-Copyright Teemu Rantalaiho 2011
+Copyright Teemu Rantalaiho 2011 - 2012
+Email: <firstname>.<lastname>@helsinki.fi
 
 This file contains a quick introduction, as well as quick instructions on how to
 use our generalized histogram code for CUDA-capable GPUs. The code is fast and
@@ -163,4 +164,6 @@ Known Issues
  - Code could use some cleaning up (it is still quite fresh out of the oven)
  - Optimization has been concentrated on Fermi-level hardware. Older hardware
      is supported, but little work has been done to optimize for it.
-
+ - Fastest way to do medium-sized histograms (For example 4x256 bins) is to
+     do multiple passes over the data with smaller number of bins (256).
+     See for example 'test_image_8b_4AC.cu'.

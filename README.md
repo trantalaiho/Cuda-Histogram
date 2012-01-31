@@ -2,21 +2,21 @@
 ----------------------------------------
 
 Copyright Teemu Rantalaiho 2011 - 2012
-Email: <firstname>.<lastname>@helsinki.fi
+Email: "firstname"."lastname"@helsinki.fi
 
 This file contains a quick introduction, as well as quick instructions on how to
 use our generalized histogram code for CUDA-capable GPUs. The code is fast and
 generic, and the abstraction has been achieved by using function objects as
 template parameters. Therefore the API is C++, but with minimal C++ features.
 What we mean by fast here, is that it wins known histogram algorithms for CUDA
-by as much as 40% to 100% in common use-cases (for example the NVIDIA
-Performance Primitives' 1-channel 256-bin histogram - tested on v.4.0.17). And
-what we mean by generic is that it supports arbitrary bin-sizes and types, which
-means that you can basically do any histogram-type of operation that comes into
-your mind with this code. As long as you need to "sum up" some kind of values
-into bins, this code can do it; You can also replace the sum by any associative
-and commutative binary operation (we require the operator to commute in order 
-to compute the sums in fastest possible order)
+by as much as 40% to 135% in common use-cases (for example the NVIDIA
+Performance Primitives' 1 and 4-channel 256-bin histogram - tested on v.4.0.17).
+And what we mean by generic is that it supports arbitrary bin-sizes and types,
+which means that you can basically do any histogram-type of operation that comes
+into your mind with this code. As long as you need to "sum up" some kind of
+values into bins, this code can do it; You can also replace the sum by any
+associative and commutative binary operation (we require the operator to commute
+in order to compute the sums in fastest possible order)
 
 What is it?
 ============

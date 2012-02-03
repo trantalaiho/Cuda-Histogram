@@ -24,7 +24,7 @@
  *
  */
 
-#define TESTMAXIDX   2355      // 16 keys / indices
+#define TESTMAXIDX   3355      // 16 keys / indices
 #define TEST_IS_POW2 0
 //#define TEST_SIZE (156620)   // 1000 million inputs
 #define TEST_SIZE 0

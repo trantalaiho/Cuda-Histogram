@@ -24,7 +24,7 @@
  *
  */
 
-#define TESTMAXIDX   1355      // 16 keys / indices
+#define TESTMAXIDX   3355      // 16 keys / indices
 #define TEST_IS_POW2 0
 #define TEST_SIZE (1)   // 1000 million inputs
 #define NRUNS 434          // Repeat 100 times => 100 gigainputs

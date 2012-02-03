@@ -267,6 +267,8 @@ void printUsage(void)
   printf("\t\t--thrust\t Run on GPU but using thrust library\n");
   printf("\t\t--csv\t\t When printing add line-feeds to ease openoffice import...\n");
   printf("\t\t--npp\t\t Use NVIDIA Performance Primitives library (NPP) instead.\n");
+  printf("\t\t--3ch\t\t Assume 24bits/pixel interleaved RGB data (default).\n");
+  printf("\t\t--4ch\t\t Assume 32bits/pixel interleaved ARGB data.\n");
 
   printf("\t\t--load <name>\t Use 32-bit texture data s\n");
 }
@@ -275,7 +277,7 @@ void printUsage(void)
 
 
 
-static void fillInput(int* input, const char* filename, int nPixels)
+static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
 {
   FILE* file = fopen(filename, "rb");
   //texture->dataRGBA8888 = NULL;
@@ -301,7 +303,8 @@ static void fillInput(int* input, const char* filename, int nPixels)
           for (i = 0; i < nPixels; i++)
           {
               unsigned int raw = 0;
-              int rsize = fread(&raw, 3, 1, file);
+              int bytesPerPixel = ch4 ? 4 : 3;
+              int rsize = fread(&raw, bytesPerPixel, 1, file);
               if (rsize != 1)
               {
                   printf(
@@ -309,7 +312,10 @@ static void fillInput(int* input, const char* filename, int nPixels)
                       filename, i);
                   break;
               }
-              data[i] = (raw & 0x00FFFFFF) | ((i & 0xFF) << 24);
+              if (ch4)
+                  data[i] = raw;
+              else
+                data[i] = (raw & 0x00FFFFFF) | ((i & 0xFFu) << 24);
 /*              r = (raw & 0x00FF0000) >> 16;
               g = (raw & 0x0000FF00) >> 8;
               b = (raw & 0x000000FF) >> 0;
@@ -331,6 +337,7 @@ int main (int argc, char** argv)
   bool print = false;
   bool thrust = false;
   bool npp = false;
+  bool ch4 = false;
 
   const char* name = "feli.raw";
 
@@ -348,6 +355,10 @@ int main (int argc, char** argv)
       print = true;
     else if (argv[i] && strcmp(argv[i], "--thrust") == 0)
       thrust = true;
+    else if (argv[i] && strcmp(argv[i], "--4ch") == 0)
+      ch4 = true;
+    else if (argv[i] && strcmp(argv[i], "--3ch") == 0)
+      ch4 = false;
     else if (argv[i] && strcmp(argv[i], "--load") == 0)
     {
       if (argc > i + 1)
@@ -359,7 +370,7 @@ int main (int argc, char** argv)
 
     int nPixels = 0;
     {
-      // Portable way to check filesize with C-apis:
+      // Portable way to check filesize with C-apis (of course safe only up to 2GB):
       FILE* file = fopen(name, "rb");
       int error = -1;
       long filesize = 0;
@@ -370,7 +381,10 @@ int main (int argc, char** argv)
         filesize = ftell(file);
         printf("File: %s, filesize = %ld\n", name, filesize);
         fclose(file);
-        nPixels = (int)((filesize / 12) << 2);
+        if (ch4)
+            nPixels = (int)((filesize / 16) << 2);
+        else
+            nPixels = (int)((filesize / 12) << 2);
         if (nPixels <= 0)
         {
           printf("Filesize is too large or small...Sorry...\n");
@@ -395,7 +409,7 @@ int main (int argc, char** argv)
     nppSize = &oSizeROI;
 #endif
     assert(hostINPUT);
-    fillInput(hostINPUT, name, nPixels);
+    fillInput(hostINPUT, name, nPixels, ch4);
     if (!cpu)
     {
       cudaMalloc(&INPUT, sizeof(int) * nPixels);

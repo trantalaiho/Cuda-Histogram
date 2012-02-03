@@ -5,7 +5,7 @@
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011 Teemu Rantalaiho
+ *  Copyright 2011 - 2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,14 @@
  *
  *
  */
+
+ /*
+  *     Note: This compiles by default to include NPP-based version, but not
+  *     Thrust based version - as of now, Thrust based version is not even
+  *     working correctly.
+  *
+  *
+  */
 
 #define TESTMAXIDX   256      // 256 keys / indices
 #define TEST_IS_POW2 1
@@ -140,7 +148,7 @@ static void printres (int* res, int nres, const char* descr)
     printresImpl(&res[3*nres/4], nres/4, "Alpha channel");
 }
 
-static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer)
+static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void** nppBuffers, void* nppResBuffer, cudaStream_t* streams)
 {
   int nIndex = TESTMAXIDX * 4;
   test_sumfun2 sumFun;
@@ -194,17 +202,17 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
       int* greengpures = &tmpbuf[TESTMAXIDX];
       int* bluegpures = &tmpbuf[TESTMAXIDX*2];
       int* alphagpures = &tmpbuf[TESTMAXIDX*3];
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, redChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, redgpures, TESTMAXIDX, true, 0, nppBuffer);
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, greenChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, greengpures, TESTMAXIDX, true, 0, nppBuffer);
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, blueChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, bluegpures, TESTMAXIDX, true, 0, nppBuffer);
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, alphaChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, alphagpures, TESTMAXIDX, true, 0, nppBuffer);
+      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, redChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, redgpures, TESTMAXIDX, true, streams[0], nppBuffers[0]);
+      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, greenChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, greengpures, TESTMAXIDX, true, streams[1], nppBuffers[1]);
+      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, blueChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, bluegpures, TESTMAXIDX, true, streams[2], nppBuffers[2]);
+      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, alphaChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, alphagpures, TESTMAXIDX, true, streams[3], nppBuffers[3]);
       cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * nIndex, cudaMemcpyDeviceToHost);
     }
     else if (npp)
     {
 #if ENABLE_NPP
         NppiSize oSizeROI = *(NppiSize*)nppSize;
-        Npp8u* pDeviceBuffer = (Npp8u*)nppBuffer;
+        Npp8u* pDeviceBuffer = (Npp8u*)nppBuffers[0];
         Npp32s* histograms[4] = { (Npp32s*)nppResBuffer, ((Npp32s*)nppResBuffer) + TESTMAXIDX, ((Npp32s*)nppResBuffer) + 2*TESTMAXIDX, ((Npp32s*)nppResBuffer) + 3*TESTMAXIDX };
         int level[4] = { TESTMAXIDX + 1, TESTMAXIDX + 1, TESTMAXIDX + 1, TESTMAXIDX + 1 };
         int lowlevel[4] = { 0, 0, 0, 0};
@@ -274,7 +282,9 @@ void printUsage(void)
   printf("\t\t--thrust\t Run on GPU but using thrust library\n");
   printf("\t\t--csv\t\t When printing add line-feeds to ease openoffice import...\n");
   printf("\t\t--npp\t\t Use NVIDIA Performance Primitives library (NPP) instead.\n");
-
+  printf("\t\t--3ch\t\t Assume 24bits/pixel interleaved RGB data (default).\n");
+  printf("\t\t--4ch\t\t Assume 32bits/pixel interleaved ARGB data.\n");
+  printf("\t\t--streams\t\t Use CUDA-streams in computation - one per channel.\n");
   printf("\t\t--load <name>\t Use 32-bit texture data s\n");
 }
 
@@ -282,7 +292,7 @@ void printUsage(void)
 
 
 
-static void fillInput(int* input, const char* filename, int nPixels)
+static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
 {
   FILE* file = fopen(filename, "rb");
   //texture->dataRGBA8888 = NULL;
@@ -308,7 +318,8 @@ static void fillInput(int* input, const char* filename, int nPixels)
           for (i = 0; i < nPixels; i++)
           {
               unsigned int raw = 0;
-              int rsize = fread(&raw, 3, 1, file);
+              int bytesPerPixel = ch4 ? 4 : 3;
+              int rsize = fread(&raw, bytesPerPixel, 1, file);
               if (rsize != 1)
               {
                   printf(
@@ -316,7 +327,10 @@ static void fillInput(int* input, const char* filename, int nPixels)
                       filename, i);
                   break;
               }
-              data[i] = (raw & 0x00FFFFFF) | ((i & 0xFFu) << 24);
+              if (ch4)
+                  data[i] = raw;
+              else
+                data[i] = (raw & 0x00FFFFFF) | ((i & 0xFFu) << 24);
 /*              r = (raw & 0x00FF0000) >> 16;
               g = (raw & 0x0000FF00) >> 8;
               b = (raw & 0x000000FF) >> 0;
@@ -338,6 +352,8 @@ int main (int argc, char** argv)
   bool print = false;
   bool thrust = false;
   bool npp = false;
+  bool ch4 = false;
+  bool use_streams = false;
 
   const char* name = "feli.raw";
 
@@ -355,6 +371,13 @@ int main (int argc, char** argv)
       print = true;
     else if (argv[i] && strcmp(argv[i], "--thrust") == 0)
       thrust = true;
+    else if (argv[i] && strcmp(argv[i], "--4ch") == 0)
+      ch4 = true;
+    else if (argv[i] && strcmp(argv[i], "--3ch") == 0)
+      ch4 = false;
+    else if (argv[i] && ((strcmp(argv[i], "--streams") == 0) ||
+                         (strcmp(argv[i], "--stream")) == 0) )
+      use_streams = true;
     else if (argv[i] && strcmp(argv[i], "--load") == 0)
     {
       if (argc > i + 1)
@@ -377,7 +400,10 @@ int main (int argc, char** argv)
         filesize = ftell(file);
         printf("File: %s, filesize = %ld\n", name, filesize);
         fclose(file);
-        nPixels = (int)((filesize / 12) << 2);
+        if (ch4)
+            nPixels = (int)((filesize / 16) << 2);
+        else
+            nPixels = (int)((filesize / 12) << 2);
         if (nPixels <= 0)
         {
           printf("Filesize is too large or small...Sorry...\n");
@@ -394,15 +420,16 @@ int main (int argc, char** argv)
     // Allocate keys:
     int* INPUT = NULL;
     int* hostINPUT = (int*)malloc(sizeof(int) * nPixels);
-    void* nppBuffer = NULL;
+    void* nppBuffers[4] = { NULL, NULL, NULL, NULL };
     void* nppResBuffer = NULL;
     void* nppSize = NULL;
+    cudaStream_t streams[4] = { 0, 0, 0, 0 };
 #if (ENABLE_NPP == 1)
     NppiSize oSizeROI = {0, 0};
     nppSize = &oSizeROI;
 #endif
     assert(hostINPUT);
-    fillInput(hostINPUT, name, nPixels);
+    fillInput(hostINPUT, name, nPixels, ch4);
     if (!cpu)
     {
       cudaMalloc(&INPUT, sizeof(int) * nPixels);
@@ -415,6 +442,13 @@ int main (int argc, char** argv)
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
+
+    if (use_streams)
+    {
+        for (int sid = 0; sid < 4; sid++)
+          cudaStreamCreate(&streams[sid]);
+    }
+
 
     if (npp)
     {
@@ -437,14 +471,15 @@ int main (int argc, char** argv)
             oSizeROI.width = width;
             oSizeROI.height = height;
             nppiHistogramEvenGetBufferSize_8u_C4R(oSizeROI, levelCounts ,&nDeviceBufferSize);
-            cudaMalloc(&nppBuffer, nDeviceBufferSize);
+            cudaMalloc(&nppBuffers[0], nDeviceBufferSize);
       #endif
     }
     else
     {
         int zero = 0;
         int tmpbufsize = getHistogramBufSize<histogram_atomic_inc>(zero , (int)(TESTMAXIDX));
-        cudaMalloc(&nppBuffer, tmpbufsize);
+        for (int sid = 0; sid < 4; sid++ )
+          cudaMalloc(&nppBuffers[sid], tmpbufsize);
     }
 
     // Now start timer - we run on stream 0 (default stream):
@@ -463,7 +498,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer);
+        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffers, nppResBuffer, &streams[0]);
       }
       print = false;
       // Run only once all stress-tests
@@ -479,7 +514,8 @@ int main (int argc, char** argv)
     }
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
-    if (nppBuffer) cudaFree(nppBuffer);
+    for (int sid = 0; sid < 4; sid++) if (nppBuffers[sid]) cudaFree(nppBuffers[sid]);
+    if (use_streams) for (int sid = 0; sid < 4; sid++) cudaStreamDestroy(streams[sid]);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
   }

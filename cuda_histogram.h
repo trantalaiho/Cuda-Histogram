@@ -654,12 +654,14 @@ void atomicAdd(OUTPUTTYPE* addr, int val)
     //*addr = val;
 }
 
+#if 0
 template <typename OUTPUTTYPE>
 static inline __device__
 void atomicAdd(OUTPUTTYPE* addr, float val)
 {
     //*addr = val;
 }
+#endif
 
 template <typename OUTPUTTYPE>
 static inline __device__
@@ -854,6 +856,63 @@ void checkStrategyFun(bool *reduce, int nSame, int nSameTot, int step, int nBinS
 #undef STR_LIMIT
 }
 
+// Special case for floats (atomicAdd works only from __CUDA_ARCH__ 200 and up)
+template <typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicAdd2(float* addr, float val, int* key, SUMFUNTYPE sumFunObj)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 200
+  atomicAdd(addr, val);
+#else
+  myAtomicAdd(addr, val, key, sumFunObj);
+#endif
+}
+
+template <typename SUMFUNTYPE,typename OUTPUTTYPE>
+static inline __device__
+void wrapAtomicAdd2(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFunObj)
+{
+  atomicAdd(addr, val);
+}
+
+
+template <typename OUTPUTTYPE, typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicAdd(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFunObj)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2(addr, val, key, sumFunObj);
+#else
+  myAtomicAdd(addr, val, key, sumFunObj);
+#endif
+}
+template <typename OUTPUTTYPE, typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicInc(OUTPUTTYPE* addr, int* key, SUMFUNTYPE sumFunObj)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2((int*)addr, 1, key, sumFunObj);
+#else
+  //myAtomicAdd((int*)addr, 1, key, sumFunObj);
+#endif
+}
+
+template <typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicInc(int* addr, int* key, SUMFUNTYPE sumFunObj)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2(addr, 1, key, sumFunObj);
+#else
+  myAtomicAdd(addr, 1, key, sumFunObj);
+#endif
+}
+
+
 
 
 template <histogram_type histotype, int nBinSetslog2, int nMultires, bool checkStrategy, bool reduce, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
@@ -909,7 +968,7 @@ void histogramKernel_stepImpl(
         //TODO: unroll loops possible??
 //#pragma unroll
         int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
-#if __CUDA_ARCH__ >= 120
+
 #define ADD_ONE_RESULT(RESID, CHECK, NSAME)                                                                                                 \
     if (RESID < nMultires) do {                                                                                                             \
         int keyIndex = (myKeys[(RESID % nMultires)] << nBinSetslog2) + binSet;                                                              \
@@ -920,26 +979,15 @@ void histogramKernel_stepImpl(
           if (histotype == histogram_generic)                                                                                               \
             myAtomicAdd(&bins[keyIndex], res[(RESID % nMultires)], &keys[keyIndex], sumfunObj);                                             \
           else if (histotype == histogram_atomic_add)                                                                                       \
-            atomicAdd(&bins[keyIndex], *(&res[(RESID % nMultires)]));                                         \
+            wrapAtomicAdd(&bins[keyIndex], *(&res[(RESID % nMultires)]), &keys[keyIndex], sumfunObj);                                       \
           else  if (histotype == histogram_atomic_inc)                                                                                      \
-            atomicAdd(&bins[keyIndex], 1);                                                                                   \
+            wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);                                                                                   \
           else{                                                                                                                             \
             myAtomicAdd(&bins[keyIndex], res[(RESID % nMultires)], &keys[keyIndex], sumfunObj);                                             \
           }                                                                                                                                 \
         }                                                                                                                                   \
     } while(0)
-#else
-#define ADD_ONE_RESULT(RESID, CHECK, NSAME)                                                                                                 \
-    if (RESID < nMultires) do {                                                                                                             \
-        int keyIndex = (myKeys[(RESID % nMultires)] << nBinSetslog2) + binSet;                                                              \
-        if (reduce || last || CHECK) {                                                                                                      \
-          bool Iwrite = reduceToUnique<histotype, CHECK>(&res[(RESID % nMultires)], myKeys[(RESID % nMultires)], NSAME, sumfunObj, keys, rOut);   \
-            if (Iwrite) bins[keyIndex] = sumfunObj(bins[keyIndex], res[(RESID % nMultires)]);                                               \
-        } else {                                                                                                                            \
-          myAtomicAdd(&bins[keyIndex], res[(RESID % nMultires)], &keys[keyIndex], sumfunObj);                                               \
-        }                                                                                                                                   \
-    } while(0)
-#endif
+
         ADD_ONE_RESULT(0, false, NULL);
         ADD_ONE_RESULT(1, false, NULL);
         ADD_ONE_RESULT(2, false, NULL);
@@ -958,21 +1006,17 @@ void histogramKernel_stepImpl(
             }
             else
             {
-#if __CUDA_ARCH__ >= 120
                 if (histotype == histogram_generic)
                   myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
                 else if (histotype == histogram_atomic_add)
-                  atomicAdd(&bins[keyIndex], *(&res[resid]));
+                  wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
                 else if (histotype == histogram_atomic_inc)
                   //atomicInc(&bins[keyIndex], 0xffffffffu);
-                  atomicAdd(&bins[keyIndex], 1);
+                  wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
                 else{
                   //#error Invalid histotype! TODO How to handle??
                   myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
                 }
-#else
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-#endif
             }
         }
       }
@@ -1010,7 +1054,17 @@ void histogramKernel_stepImpl(
           }
           else
           {
-              myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
+              if (histotype == histogram_generic)
+                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
+              else if (histotype == histogram_atomic_add)
+                wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
+              else if (histotype == histogram_atomic_inc)
+                //atomicInc(&bins[keyIndex], 0xffffffffu);
+                wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
+              else{
+                //#error Invalid histotype! TODO How to handle??
+                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
+              }
               nSame = (nSame) << nBinSetslog2;
           }
       }
@@ -1053,21 +1107,17 @@ void histogramKernel_stepImpl(
             else
             {
               // TODO: How to avoid bank-conflicts? Any way to avoid?
-#if __CUDA_ARCH__ >= 120
               if (histotype == histogram_generic)
                 myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
               else if (histotype == histogram_atomic_add)
-                atomicAdd(&bins[keyIndex], *(&res[resid]));
+                wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
               else  if (histotype == histogram_atomic_inc)
                 //atomicInc(&bins[keyIndex], 0xffffffffu);
-                  atomicAdd(&bins[keyIndex], 1);
+                wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
               else{
                 //#error Invalid histotype! TODO How to handle??
                 myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
                 }
-#else
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-#endif
             }
         }
       }
@@ -1089,7 +1139,9 @@ void histogramKernel_sharedbins_new(
     int outStride,
     int nSteps)
 {
-  extern __shared__ OUTPUTTYPE bins[];
+  extern __shared__ int cudahistogram_binstmp[];
+  OUTPUTTYPE* bins = (OUTPUTTYPE*)&(*cudahistogram_binstmp);
+
   int* keys = (int*)&bins[(nOut << nBinSetslog2)];
   OUTPUTTYPE* redOut = (OUTPUTTYPE*)&keys[nOut];
   const int nBinSets = 1 << nBinSetslog2;
@@ -2279,7 +2331,11 @@ void histoKernel_smallBin(
     OUTPUTTYPE* blockOut, int nOut, int maxblocks,
     int nSteps)
 {
-    extern __shared__ OUTPUTTYPE allbins[];
+    // Take care with extern - In order to have two instances of this template the
+    // type of the extern variables cannot change
+    // (ie. cannot use "extern __shared__ OUTPUTTYPE bins[]")
+    extern __shared__ int cudahistogram_allbinstmp[];
+    OUTPUTTYPE* allbins = (OUTPUTTYPE*)&(*cudahistogram_allbinstmp);
     OUTPUTTYPE* mySHBins = &allbins[threadIdx.x];
     OUTPUTTYPE* ourOut = &blockOut[nOut * blockIdx.x];
     int myStart = start + ((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x;

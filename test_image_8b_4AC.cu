@@ -5,7 +5,7 @@
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011 Teemu Rantalaiho
+ *  Copyright 2011-2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,24 @@
  *
  *
  */
+
+ /*
+  *     Note: This compiles by default to include NPP-based version, but not
+  *     Thrust based version - as of now, Thrust based version is not even
+  *     working correctly.
+  *
+  *     The option "--alpha" triggers a generalized histogram computation
+  *     code-path, in which we compute the image-histogram so that each
+  *     sample is weighted by its alpha-value, therefore if we have the
+  *     pixel ( r = 100, g = 100, b = 200, a = 127) we add the number 0.5 to
+  *     bins: red[100], green[100], blue[200], instead of the typical 1's,
+  *     as in normal histograms. NOTE: With this version CPU and GPU results
+  *     are bound to differ a bit, due to different order of floating point
+  *     operations (remember that floating point addition is not strictly
+  *     associative for example).
+  */
+
+
 
 #define TESTMAXIDX   256      // 256 keys / indices
 #define TEST_IS_POW2 1
@@ -110,42 +128,84 @@ struct test_sumfun2 {
 };
 
 
-static void printresImpl (int* res, int nres, const char* descr)
+// Now return alpha/255 -> Generalized histogram - each sample has the weight of its alpha
+template <int channel>
+struct xformChannelAlpha
 {
+  __host__ __device__
+  void operator() (uint4* input, int i, int* result_index, float* results, int nresults) const {
+    uint4 idata = input[i];
+#pragma unroll
+    for (int resIdx = 0; resIdx < 4; resIdx++)
+    {
+        /*
+         * int r = (data >> 16) & 0xFF;
+         * int g = (data >>  8) & 0xFF;
+         * int b = (data >>  0) & 0xFF;
+         */
+        // Extract channel
+        unsigned int data = ((unsigned int*)(&idata))[resIdx];
+        int result = (data >> (8 * channel)) & 0xFF;
+        int alpha =  (data >> (8 * 3)) & 0xFF;
+        *result_index++ = result;
+        *results++ = ((float)alpha) / 255.0f;
+    }
+  }
+};
+
+struct alpha_sumfun {
+  __device__ __host__
+  float operator() (float res1, float res2) const{
+    return res1 + res2;
+  }
+};
+
+
+
+
+static void printresImpl (int* res, int nres, const char* descr, bool alpha)
+{
+    float* fres = (float*)res;
     if (descr)
         printf("\n%s:\n", descr);
     if (csv)
     {
       printf("[\n");
       for (int i = 0; i < nres; i++)
-          printf("%d\n", res[i]);
+          if (alpha) printf("%.3f\n", fres[i]); else printf("%d\n", res[i]);
       printf("]\n");
     }
     else
     {
       printf("[ ");
       for (int i = 0; i < nres; i++)
-          printf(" %d, ", res[i]);
+          if (alpha) printf(" %.3f, ", fres[i]); else printf(" %d, ", res[i]);
       printf("]\n");
     }
 }
 
-static void printres (int* res, int nres, const char* descr)
+static void printres (int* res, int nres, const char* descr, bool alpha)
 {
     if (descr)
         printf("\n%s:\n", descr);
-    printresImpl(res, nres/3, "Red channel");
-    printresImpl(&res[nres/3], nres/3, "Green channel");
-    printresImpl(&res[2*nres/3], nres/3, "Blue channel");
+    printresImpl(res, nres/3, "Red channel", alpha);
+    printresImpl(&res[nres/3], nres/3, "Green channel", alpha);
+    printresImpl(&res[2*nres/3], nres/3, "Blue channel", alpha);
 }
 
-static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer)
+static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer, bool alpha)
 {
   int nIndex = TESTMAXIDX * 3;
   test_sumfun2 sumFun;
+  alpha_sumfun floatSumFun;
   test_xformChannel<0> redChannel;
   test_xformChannel<1> greenChannel;
   test_xformChannel<2> blueChannel;
+
+  xformChannelAlpha<0> redChannelAlpha;
+  xformChannelAlpha<1> greenChannelAlpha;
+  xformChannelAlpha<2> blueChannelAlpha;
+
 
   int* tmpres = (int*)malloc(sizeof(int) * nIndex);
   int* cpures = tmpres;
@@ -159,7 +219,26 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
         printf("\nTest reduce_by_key:\n\n");
       memset(tmpres, 0, sizeof(int) * nIndex);
       if (cpurun)
-        for (int i = 0; i < (nPixels >> 2); i++)
+      {
+        if (alpha) for (int i = 0; i < (nPixels >> 2); i++)
+        {
+          int index[4];
+          float tmp[4];
+          float* redfres = (float*)redres;
+          float* greenfres = (float*)greenres;
+          float* bluefres = (float*)blueres;
+          redChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
+          for (int tmpi = 0; tmpi < 4; tmpi++)
+              redfres[index[tmpi]] = floatSumFun(redfres[index[tmpi]], tmp[tmpi]);
+          greenChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
+          for (int tmpi = 0; tmpi < 4; tmpi++)
+              greenfres[index[tmpi]] = floatSumFun(greenfres[index[tmpi]], tmp[tmpi]);
+          blueChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
+          for (int tmpi = 0; tmpi < 4; tmpi++)
+              bluefres[index[tmpi]] = floatSumFun(bluefres[index[tmpi]], tmp[tmpi]);
+          //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+        }
+        else  for (int i = 0; i < (nPixels >> 2); i++)
         {
           int index[4];
           int tmp[4];
@@ -175,9 +254,10 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
 
           //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
         }
+      }
       if (print && cpurun)
       {
-          printres(cpures, nIndex, "CPU results:");
+          printres(cpures, nIndex, "CPU results:", alpha);
       }
     }
 
@@ -187,9 +267,19 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
       int* redgpures = &tmpbuf[0];
       int* greengpures = &tmpbuf[TESTMAXIDX];
       int* bluegpures = &tmpbuf[TESTMAXIDX*2];
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, redChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, redgpures, TESTMAXIDX, true, 0, nppBuffer);
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, greenChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, greengpures, TESTMAXIDX, true, 0, nppBuffer);
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, blueChannel, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, bluegpures, TESTMAXIDX, true, 0, nppBuffer);
+      if (alpha)
+      {
+        float fzero = 0.0f;
+        callHistogramKernel<histogram_atomic_add, 4>(INPUT, redChannelAlpha,  floatSumFun, 0, (nPixels >> 2), fzero, (float*)redgpures, TESTMAXIDX, true, 0, nppBuffer);
+        callHistogramKernel<histogram_atomic_add, 4>(INPUT, greenChannelAlpha, floatSumFun, 0, (nPixels >> 2), fzero, (float*)greengpures, TESTMAXIDX, true, 0, nppBuffer);
+        callHistogramKernel<histogram_atomic_add, 4>(INPUT, blueChannelAlpha, floatSumFun, 0, (nPixels >> 2), fzero, (float*)bluegpures, TESTMAXIDX, true, 0, nppBuffer);
+      }
+      else
+      {
+        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, redChannel, sumFun, 0, (nPixels >> 2), zero, redgpures, TESTMAXIDX, true, 0, nppBuffer);
+        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, greenChannel, sumFun, 0, (nPixels >> 2), zero, greengpures, TESTMAXIDX, true, 0, nppBuffer);
+        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, blueChannel, sumFun, 0, (nPixels >> 2), zero, bluegpures, TESTMAXIDX, true, 0, nppBuffer);
+      }
       cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * nIndex, cudaMemcpyDeviceToHost);
     }
     else if (npp)
@@ -211,7 +301,7 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
 
     if (print && (!cpurun))
     {
-      printres(tmpres, nIndex, "GPU results:");
+      printres(tmpres, nIndex, "GPU results:", alpha);
     }
 
   }
@@ -266,7 +356,9 @@ void printUsage(void)
   printf("\t\t--thrust\t Run on GPU but using thrust library\n");
   printf("\t\t--csv\t\t When printing add line-feeds to ease openoffice import...\n");
   printf("\t\t--npp\t\t Use NVIDIA Performance Primitives library (NPP) instead.\n");
-
+  printf("\t\t--3ch\t\t Assume 24bits/pixel interleaved RGB data (default).\n");
+  printf("\t\t--4ch\t\t Assume 32bits/pixel interleaved ARGB data.\n");
+  printf("\t\t--alpha\t\t Compute generalized histogram with alpha value as pixel weight.\n");
   printf("\t\t--load <name>\t Use 32-bit texture data s\n");
 }
 
@@ -274,7 +366,7 @@ void printUsage(void)
 
 
 
-static void fillInput(int* input, const char* filename, int nPixels)
+static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
 {
   FILE* file = fopen(filename, "rb");
   //texture->dataRGBA8888 = NULL;
@@ -300,7 +392,8 @@ static void fillInput(int* input, const char* filename, int nPixels)
           for (i = 0; i < nPixels; i++)
           {
               unsigned int raw = 0;
-              int rsize = fread(&raw, 3, 1, file);
+              int bytesPerPixel = ch4 ? 4 : 3;
+              int rsize = fread(&raw, bytesPerPixel, 1, file);
               if (rsize != 1)
               {
                   printf(
@@ -308,7 +401,10 @@ static void fillInput(int* input, const char* filename, int nPixels)
                       filename, i);
                   break;
               }
-              data[i] = (raw & 0x00FFFFFF) | ((0xFFu) << 24);
+              if (ch4)
+                  data[i] = raw;
+              else
+                data[i] = (raw & 0x00FFFFFF) | ((i & 0xFFu) << 24);
 /*              r = (raw & 0x00FF0000) >> 16;
               g = (raw & 0x0000FF00) >> 8;
               b = (raw & 0x000000FF) >> 0;
@@ -330,6 +426,8 @@ int main (int argc, char** argv)
   bool print = false;
   bool thrust = false;
   bool npp = false;
+  bool ch4 = false;
+  bool alpha = false;
 
   const char* name = "feli.raw";
 
@@ -347,6 +445,12 @@ int main (int argc, char** argv)
       print = true;
     else if (argv[i] && strcmp(argv[i], "--thrust") == 0)
       thrust = true;
+    else if (argv[i] && strcmp(argv[i], "--4ch") == 0)
+      ch4 = true;
+    else if (argv[i] && strcmp(argv[i], "--3ch") == 0)
+      ch4 = false;
+    else if (argv[i] && strcmp(argv[i], "--alpha") == 0)
+      alpha = true;
     else if (argv[i] && strcmp(argv[i], "--load") == 0)
     {
       if (argc > i + 1)
@@ -369,7 +473,10 @@ int main (int argc, char** argv)
         filesize = ftell(file);
         printf("File: %s, filesize = %ld\n", name, filesize);
         fclose(file);
-        nPixels = (int)((filesize / 12) << 2);
+        if (ch4)
+            nPixels = (int)((filesize / 16) << 2);
+        else
+            nPixels = (int)((filesize / 12) << 2);
         if (nPixels <= 0)
         {
           printf("Filesize is too large or small...Sorry...\n");
@@ -394,7 +501,7 @@ int main (int argc, char** argv)
     nppSize = &oSizeROI;
 #endif
     assert(hostINPUT);
-    fillInput(hostINPUT, name, nPixels);
+    fillInput(hostINPUT, name, nPixels, ch4);
     if (!cpu)
     {
       cudaMalloc(&INPUT, sizeof(int) * nPixels);
@@ -455,7 +562,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer);
+        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer, alpha);
       }
       print = false;
       // Run only once all stress-tests

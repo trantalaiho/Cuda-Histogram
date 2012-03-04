@@ -5,7 +5,7 @@
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011 Teemu Rantalaiho
+ *  Copyright 2011 - 2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -110,6 +110,40 @@ struct test_xform2
   }
 };
 
+typedef struct image_input_s
+{
+    uint4* image_data;
+    int stride; // in uint4 = 16 bytes
+    int height;
+} image_input;
+// Always return 1 -> normal histogram - each sample has same weight
+struct xform2dFun
+{
+  __host__ __device__
+  void operator() (image_input input, int* coords, int* result_index, int* results, int nresults) const {
+    int x = coords[0];
+    int y = coords[1];
+    int index = x + input.stride * y;
+    uint4 idata = input.image_data[index];
+#pragma unroll
+    for (int resIdx = 0; resIdx < 4; resIdx++)
+    {
+        unsigned int data = ((unsigned int*)(&idata))[resIdx];
+        *result_index++ = (data >> 24);
+        *result_index++ = (data >> 16) & 0XFF;
+        *result_index++ = (data >>  8) & 0XFF;
+        *result_index++ = (data >>  0) & 0XFF;
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
+    }
+  }
+};
+
+
+
+
 // Always return 1 -> normal histogram - each sample has same weight
 struct test_xform_old
 {
@@ -157,12 +191,15 @@ static void printres (int* res, int nres, const char* descr)
     }
 }
 
-static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer)
+static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer, int width, int height, bool use2d)
 {
   int nIndex = TESTMAXIDX;
   test_sumfun2 sumFun;
   test_xform2 transformFun;
-  test_xform_old transformFunOld;
+  xform2dFun xform2d;
+  image_input image;
+  image.height = height;
+  image.stride = width / 4;
   //test_indexfun2 indexFun;
   int* tmpres = (int*)malloc(sizeof(int) * nIndex);
   int* cpures = tmpres;
@@ -173,14 +210,31 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
         printf("\nTest reduce_by_key:\n\n");
       memset(tmpres, 0, sizeof(int) * nIndex);
       if (cpurun)
-        for (int i = 0; i < (nPixels >> 2); i++)
+        if (use2d)
         {
-          int index[16];
-          int tmp[16];
-          transformFun(hostINPUT, i, &index[0], &tmp[0], 16);
-          for (int tmpi = 0; tmpi < 16; tmpi++)
-              cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
-          //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+            image.image_data = hostINPUT;
+            for (int y = 0; y < height; y++)
+            for (int x = 0; x < width/4; x++)
+            {
+                int index[16];
+                int tmp[16];
+                int coord[2] = { x, y };
+                xform2d(image, coord, &index[0], &tmp[0], 16);
+                for (int tmpi = 0; tmpi < 16; tmpi++)
+                    cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < (nPixels >> 2); i++)
+            {
+              int index[16];
+              int tmp[16];
+              transformFun(hostINPUT, i, &index[0], &tmp[0], 16);
+              for (int tmpi = 0; tmpi < 16; tmpi++)
+                  cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
+              //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+            }
         }
       if (print && cpurun)
       {
@@ -190,11 +244,18 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
 
     if (!cpurun && !npp)
     {
+        if (!use2d){
 #if FOR_PRE_FERMI
-      callHistogramKernel<histogram_atomic_inc, 4>((unsigned int*)INPUT, transformFunOld, /*indexFun,*/ sumFun, 0, (nPixels), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+            callHistogramKernel<histogram_atomic_inc, 4>((unsigned int*)INPUT, transformFunOld, /*indexFun,*/ sumFun, 0, (nPixels), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
 #else
-      callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFun, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+            callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFun, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
 #endif
+        }
+        else
+        {
+            image.image_data = INPUT;
+            callHistogramKernel2Dim<histogram_atomic_inc, 16>(image, xform2d, sumFun, 0, width/4, 0, height, zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+        }
       cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * TESTMAXIDX, cudaMemcpyDeviceToHost);
     }
     else if (npp)
@@ -270,14 +331,15 @@ void printUsage(void)
   printf("\t\t--3ch\t\t Assume 24bits/pixel interleaved RGB data (default).\n");
   printf("\t\t--4ch\t\t Assume 32bits/pixel interleaved ARGB data.\n");
 
-  printf("\t\t--load <name>\t Use 32-bit texture data s\n");
+  printf("\t\t--load <name>\t Use 32-bit texture data\n");
+  printf("\t\t--2d\t\t Run histogram using 2d-indexing\n");
 }
 
 
 
 
 
-static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
+static void fillInput(int* input, const char* filename, int nPixels, bool ch4, bool header)
 {
   FILE* file = fopen(filename, "rb");
   //texture->dataRGBA8888 = NULL;
@@ -300,10 +362,12 @@ static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
       if (data)
       {
           int i;
+          if (header) fseek(file, 16, SEEK_SET);
           for (i = 0; i < nPixels; i++)
           {
               unsigned int raw = 0;
               int bytesPerPixel = ch4 ? 4 : 3;
+
               int rsize = fread(&raw, bytesPerPixel, 1, file);
               if (rsize != 1)
               {
@@ -338,6 +402,7 @@ int main (int argc, char** argv)
   bool thrust = false;
   bool npp = false;
   bool ch4 = false;
+  bool use2d = false;
 
   const char* name = "feli.raw";
 
@@ -359,13 +424,17 @@ int main (int argc, char** argv)
       ch4 = true;
     else if (argv[i] && strcmp(argv[i], "--3ch") == 0)
       ch4 = false;
+    else if (argv[i] && strcmp(argv[i], "--2d") == 0)
+      use2d = true;
     else if (argv[i] && strcmp(argv[i], "--load") == 0)
     {
       if (argc > i + 1)
         name = argv[i + 1];
     }
   }
-
+  int width = 0;
+  int height = 0;
+  int nchannels = 0;
   {
 
     int nPixels = 0;
@@ -374,11 +443,23 @@ int main (int argc, char** argv)
       FILE* file = fopen(name, "rb");
       int error = -1;
       long filesize = 0;
+      int token = 0;
       if (file)
-        error = fseek(file, 0, SEEK_END);
+      {
+          // Check header first:
+          fread(&token, 4, 1, file);
+          if (token == -2999999)
+          {
+              fread(&width, 4, 1, file);
+              fread(&height, 4, 1, file);
+              fread(&nchannels, 4, 1, file);
+          }
+          error = fseek(file, 0, SEEK_END);
+      }
       if (error == 0)
       {
         filesize = ftell(file);
+        if (token == -2999999) filesize -= 16;
         printf("File: %s, filesize = %ld\n", name, filesize);
         fclose(file);
         if (ch4)
@@ -400,6 +481,7 @@ int main (int argc, char** argv)
 
     // Allocate keys:
     int* INPUT = NULL;
+
     int* hostINPUT = (int*)malloc(sizeof(int) * nPixels);
     void* nppBuffer = NULL;
     void* nppResBuffer = NULL;
@@ -409,7 +491,9 @@ int main (int argc, char** argv)
     nppSize = &oSizeROI;
 #endif
     assert(hostINPUT);
-    fillInput(hostINPUT, name, nPixels, ch4);
+    if (nchannels == 4) ch4 = true;
+    else if (nchannels == 3) ch4 = false;
+    fillInput(hostINPUT, name, nPixels, ch4, nchannels > 0);
     if (!cpu)
     {
       cudaMalloc(&INPUT, sizeof(int) * nPixels);
@@ -432,14 +516,17 @@ int main (int argc, char** argv)
             int nDeviceBufferSize;
             int levelCount = TESTMAXIDX + 1;
             // Start guessing from 4096 and div by two
-            int width = 4096;
-            int height = nPixels / width;
-            while (width > 128)
+            if (width == 0)
             {
-                if (width * height == nPixels)
-                    break;
-                width >>= 1;
+                width = 4096;
                 height = nPixels / width;
+                while (width > 128)
+                {
+                    if (width * height == nPixels)
+                        break;
+                    width >>= 1;
+                    height = nPixels / width;
+                }
             }
             oSizeROI.width = width*4;
             oSizeROI.height = height;
@@ -470,7 +557,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer);
+        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer, width, height, use2d);
       }
       print = false;
       // Run only once all stress-tests

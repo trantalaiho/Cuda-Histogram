@@ -2985,6 +2985,97 @@ callHistogramKernel(
     return cudaSuccess;
 }
 
+template <typename nDimIndexFun, int nDim, typename USERINPUTTYPE>
+class wrapHistoInput
+{
+public:
+    nDimIndexFun userIndexFun;
+    int starts[nDim];
+    //int ends[nDim];
+    int sizes[nDim];
+    __host__ __device__
+    void operator() (USERINPUTTYPE input, int i, int* result_index, int* results, int nresults) const {
+        int coords[nDim];
+        int tmpi = i;
+  #pragma unroll
+        for (int d=0; d < nDim; d++)
+        {
+            // Example of how this logic works - imagine a cube of (10,100,1000), and take index 123 456
+            // newI = 123 456 / 10 = 12 345, offset = 123 456 - 123 450 = 6 (this is our first coordinate!),
+            // newI = 12 345 / 100 = 123,    offset = 12 345 - 12 300 = 45 (this is our second coordinate!),
+            // newI = 123 / 1000 = 0,        offset = 123 - 0 = 123 (this is our last coordinate!)
+            // Result = [123, 45, 6]
+            int newI = tmpi / sizes[d];
+            int offset = tmpi - newI * sizes[d];
+            coords[d] = starts[d] + offset;
+            tmpi = newI;
+        }
+        // Now just call wrapped functor with right coordinate values
+        userIndexFun(input, coords, result_index, results, nresults);
+    }
+};
+
+/*template <int nDim>
+struct wraphistogram_nDimXform
+{
+};*/
+
+
+
+template <histogram_type histotype, int nMultires, int nDim, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+cudaError_t
+callHistogramKernelNDim(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    /*INDEXFUNTYPE indexfunObj,*/
+    SUMFUNTYPE sumfunObj,
+    int* starts, int* ends,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
+    bool outInDev,
+    cudaStream_t stream, void* tmpBuffer)
+{
+    wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE> wrapInput;
+    int start = 0;
+    int size = 1;
+    for (int d = 0; d < nDim; d++)
+    {
+        wrapInput.starts[d] = starts[d];
+        wrapInput.sizes[d] = ends[d] - starts[d];
+        // Example: starts = [3, 10, 23], sizes = [10, 100, 1000]
+        // start = 3 * 1 = 3, size = 10
+        // start = 3 + 10 * 10 = 103, size = 10*100 = 1000
+        // start = 103 + 1000*23 = 23 103, size = 1000*1000 = 1 000 000
+        start += starts[d] * size;
+        size *= wrapInput.sizes[d];
+        if (ends[d] <= starts[d]) return cudaSuccess;
+    }
+    wrapInput.userIndexFun = xformObj;
+    int end = start + size;
+    return callHistogramKernel<histotype, nMultires>
+        (input, wrapInput, sumfunObj, start, end, zero, out, nOut, outInDev, stream, tmpBuffer);
+}
+
+template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+cudaError_t
+callHistogramKernel2Dim(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    /*INDEXFUNTYPE indexfunObj,*/
+    SUMFUNTYPE sumfunObj,
+    int x0, int x1,
+    int y0, int y1,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
+    bool outInDev,
+    cudaStream_t stream, void* tmpBuffer)
+{
+    int starts[2] = { x0, y0 };
+    int ends[2] = { x1, y1 };
+    return callHistogramKernelNDim<histotype, nMultires, 2>
+        (input, xformObj, sumfunObj, starts, ends, zero, out, nOut, outInDev, stream, tmpBuffer);
+
+}
+
+
 struct histogram_defaultXform
 {
   __host__ __device__

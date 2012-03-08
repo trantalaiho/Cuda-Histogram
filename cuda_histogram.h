@@ -61,7 +61,7 @@ enum histogram_type {
  *//**************************************************************************/
 
 template <histogram_type histotype, typename OUTPUTTYPE>
-static inline
+static
 int
 getHistogramBufSize(OUTPUTTYPE zero, int nOut);
 
@@ -72,6 +72,7 @@ getHistogramBufSize(OUTPUTTYPE zero, int nOut);
  *
  * \tparam  histotype   Type of histogram: generic, atomic-inc or atomic-add
  * \tparam  nMultires   Number of results each input produces. Typically 1
+ * \tparam  INDEXT      Integer type to be used for indexing (int, size_t, ...)
  * \tparam  INPUTTYPE   Arbitrary type passed in as input
  * \tparam  TRANSFORMFUNTYPE    Function object that takes in the input, index
  *                              and produces 'nMultires' results and indices.
@@ -120,23 +121,76 @@ getHistogramBufSize(OUTPUTTYPE zero, int nOut);
  *                      \ref getHistogramBufSize().
  *//**************************************************************************/
 
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline
+template <histogram_type histotype, int nMultires,
+            typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+            typename OUTPUTTYPE, typename INDEXT>
+static
 cudaError_t
 callHistogramKernel(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev = false,
     cudaStream_t stream = 0, void* tmpBuffer = NULL);
 
 
 
+/*------------------------------------------------------------------------*//*!
+ * \brief   Histogram implementation with multidimensional input indices
+ *
+ *  Exactly as \ref callHistogramKernel(), except that input-indices
+ *  are replaced by a multidimensional array of indices
+ *
+ * \tparam  nDim        Number of dimesions in multidimensional indices
+ * \param   starts      Array of length nDim, giving starting index for
+ *                      each dimension of input indices (exclusive (*))
+ * \param   ends        Array of length nDim, giving ending index for
+ *                      each dimension of input indices (inclusive)
+ * \note    (*) Indices are the [start, start + size - 1], size =  end - start
+ *//**************************************************************************/
+
+template <histogram_type histotype, int nMultires, int nDim,
+            typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+            typename OUTPUTTYPE, typename INDEXT>
+static
+cudaError_t
+callHistogramKernelNDim(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT* starts, INDEXT* ends,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
+    bool outInDev = false,
+    cudaStream_t stream = 0, void* tmpBuffer = NULL);
 
 
+/*------------------------------------------------------------------------*//*!
+ * \brief   Histogram implementation with two-dimensional input indices
+ *
+ *  Exactly as \ref callHistogramKernel(), except that input-indices
+ *  are replaced by a two indices
+ *
+ * \param   x0          Start x-coordinate
+ * \param   x1          End x-coordinate (width = x1 - x0)
+ * \param   y0          Start y-coordinate
+ * \param   y1          End y-coordinate (height = y1 - y0)
+ *//**************************************************************************/
+
+template <histogram_type histotype, int nMultires,
+            typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+            typename OUTPUTTYPE, typename INDEXT>
+cudaError_t
+callHistogramKernel2Dim(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT x0, INDEXT x1,
+    INDEXT y0, INDEXT y1,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
+    bool outInDev,
+    cudaStream_t stream, void* tmpBuffer);
 
 
 
@@ -304,7 +358,7 @@ void multireduceKernel(OUTPUTTYPE* input, int n, int nOut, int nsteps, SUMFUNTYP
  *//**************************************************************************/
 
 template <typename OUTPUTTYPE, typename SUMFUNTYPE>
-static inline
+static
 void callMultiReduce(
     int arrLen, int nOut, OUTPUTTYPE* h_results, OUTPUTTYPE* input,
     SUMFUNTYPE sumFunObj, OUTPUTTYPE zero,
@@ -770,75 +824,6 @@ bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj
 #endif
 }
 
-template<bool checkNSame, int nBinSetslog2, typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline __device__
-bool subReduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj)
-{
-    __shared__ OUTPUTTYPE outputs[HBLOCK_SIZE];
-    __shared__ int keys[HBLOCK_SIZE];
-    if (nBinSetslog2 == HBLOCK_SIZE_LOG2)
-    {
-        return true;
-    }
-    else
-    {
-        outputs[threadIdx.x] = *res;
-        keys[threadIdx.x] = myKey;
-        {
-
-          int i;
-          bool writeResult = true;
-          int myIdx = threadIdx.x + (1 << nBinSetslog2);
-          // 8 binsets: => BLOCKSIZE / binsets = 4, block_size_log2 - binSetsLog2 = 5 - 3 = 2
-          // Thread-id:5 => 5 / 4 = 1, (5 >> 2) = 5 / 4 = 1
-          // Then add 1: 1+1 = 2, and 2x4 ) 8 => limit = 8, (2 << 2 = 8)
-    /*      int sublimit =
-              ((threadIdx.x >> (HBLOCK_SIZE_LOG2 - nBinSetslog2)) + 1) << (HBLOCK_SIZE_LOG2 - nBinSetslog2);*/
-          // The assumption for sanity of this loop here is that all the data is in registers or shared memory and
-          // hence this loop will not actually be __that__ slow.. Also it helps if the data is spread out (ie. there are
-          // a lot of different indices here)
-
-          // Example: nbinsets = 8
-          // tid = 1, => myIdx = 1 + 8 = 9
-          // For i = 1 to 4 => myIdx = 9, 17, 25
-          // Another: tid = 17 => myIdx = 17 + 8 = 25
-          // For i = 1 to 4 => myIdx = 25, 33 => 1, 9
-          for (i = 1; i < (HBLOCK_SIZE >> nBinSetslog2) && writeResult; i++)
-          {
-            if (myIdx >= HBLOCK_SIZE)
-                myIdx -= (HBLOCK_SIZE);
-              //myIdx -= (HBLOCK_SIZE >> nBinSetslog2);
-            // Is my index the same as the index on the index-list?
-            if (keys[myIdx] == myKey /*&& threadIdx.x != myIdx*/)
-            {
-              if (checkNSame) (*nSame)++;
-              // If yes, then we can sum up the result using users sum-functor
-              if (myIdx < threadIdx.x)
-                writeResult = false;
-              else
-                *res = sumfunObj(*res, outputs[myIdx]);
-              // But if somebody else is summing up this index already, we don't need to (wasted effort done here)
-            }
-            myIdx += (1 << nBinSetslog2);
-          }
-          if (checkNSame)
-          {
-              // Manual reduce
-              int tid = threadIdx.x;
-              keys[tid] = *nSame;
-              if (tid < 16) keys[tid] = keys[tid] > keys[tid + 16] ? keys[tid] : keys[tid+16];
-              if (tid < 8) keys[tid] = keys[tid] > keys[tid + 8] ? keys[tid] : keys[tid+8];
-              if (tid < 4) keys[tid] = keys[tid] > keys[tid + 4] ? keys[tid] : keys[tid+4];
-              if (tid < 2) keys[tid] = keys[tid] > keys[tid + 2] ? keys[tid] : keys[tid+2];
-              if (tid < 1) keys[tid] = keys[tid] > keys[tid + 1] ? keys[tid] : keys[tid+1];
-              *nSame = keys[0];
-          }
-          return writeResult;
-        }
-    }
-}
-
-
 
 static inline __host__ __device__
 void checkStrategyFun(bool *reduce, int nSame, int nSameTot, int step, int nBinSetslog2)
@@ -915,15 +900,15 @@ void wrapAtomicInc(int* addr, int* key, SUMFUNTYPE sumFunObj)
 
 
 
-template <histogram_type histotype, int nBinSetslog2, int nMultires, bool checkStrategy, bool reduce, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nBinSetslog2, int nMultires, bool checkStrategy, bool reduce, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 static inline __device__
 void histogramKernel_stepImpl(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int end,
+    INDEXT end,
     OUTPUTTYPE zero,
-    int nOut, int& startidx, bool* reduceOut, int nStepsRem,
+    int nOut, INDEXT& startidx, bool* reduceOut, int nStepsRem,
     OUTPUTTYPE* bins, int* keys, int nthstep, int* nSameTot, OUTPUTTYPE* rOut)
 {
   if (laststep)
@@ -934,7 +919,7 @@ void histogramKernel_stepImpl(
         OUTPUTTYPE res[nMultires];
         bool last = false;
         {
-            int idx = threadIdx.x + startidx;
+            INDEXT idx = (INDEXT)threadIdx.x + startidx;
             if (idx < end)
             {
                 xformObj(input, idx, &myKeys[0], &res[0], nMultires);
@@ -1027,7 +1012,7 @@ void histogramKernel_stepImpl(
     {
       int myKeys[nMultires];
       OUTPUTTYPE res[nMultires];
-      int idx = threadIdx.x + startidx;
+      INDEXT idx = (INDEXT)threadIdx.x + startidx;
       xformObj(input, idx, &myKeys[0], &res[0], nMultires);
       // Now what do we do
       int nSame = 0;
@@ -1083,7 +1068,7 @@ void histogramKernel_stepImpl(
         bool last = false;
         int myKeys[nMultires];
         OUTPUTTYPE res[nMultires];
-        int idx = threadIdx.x + startidx;
+        INDEXT idx = (INDEXT)threadIdx.x + startidx;
         xformObj(input, idx, &myKeys[0], &res[0], nMultires);
         // Now what do we do
         //reduce = true;
@@ -1127,13 +1112,13 @@ void histogramKernel_stepImpl(
 }
 
 
-template <int nBinSetslog2, histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <int nBinSetslog2, histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histogramKernel_sharedbins_new(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* blockOut, int nOut,
     int outStride,
@@ -1155,7 +1140,7 @@ void histogramKernel_sharedbins_new(
   }
   bool reduce = false;
   int outidx = blockIdx.x;
-  int startidx = (outidx * nSteps) * HBLOCK_SIZE + start;
+  INDEXT startidx = (INDEXT)(outidx * nSteps) * HBLOCK_SIZE + start;
 
   int nSameTot = 0;
 
@@ -1166,7 +1151,7 @@ void histogramKernel_sharedbins_new(
   // NOTE: Last block may need to adjust number of steps to not run over the end
   if (blockIdx.x == gridDim.x - 1)
   {
-    int locsize = (end - startidx);
+    INDEXT locsize = (end - startidx);
     nSteps = (locsize >> HBLOCK_SIZE_LOG2);
     if (nSteps << HBLOCK_SIZE_LOG2 < locsize)
       nSteps++;
@@ -1470,10 +1455,10 @@ void AddToHash(OUTPUTTYPE res, int myKey, struct myHash<OUTPUTTYPE> *hash, SUMFU
 #endif
 
 
-template <histogram_type histotype, int nMultires, bool reduce, bool checkStrategy, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires, bool reduce, bool checkStrategy, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 static inline __device__
 void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE sumfunObj, OUTPUTTYPE zero,
-                int* myStart, int end, struct myHash<OUTPUTTYPE> *hash, OUTPUTTYPE* blockOut, int nOut, int stepNum, int stepsleft, int* nSameTot, bool* reduceOut, int hashSizelog2,
+                INDEXT* myStart, INDEXT end, struct myHash<OUTPUTTYPE> *hash, OUTPUTTYPE* blockOut, int nOut, int stepNum, int stepsleft, int* nSameTot, bool* reduceOut, int hashSizelog2,
                 OUTPUTTYPE* rOuts, int* rKeys)
 {
     if (!laststep)
@@ -1511,7 +1496,7 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
         }
         else
         {
-            int startLim = *myStart + ((LBLOCK_SIZE << LARGE_NBIN_CHECK_INTERVAL_LOG2) - LBLOCK_SIZE);
+            INDEXT startLim = *myStart + ((LBLOCK_SIZE << LARGE_NBIN_CHECK_INTERVAL_LOG2) - LBLOCK_SIZE);
             for (; *myStart < startLim; *myStart += LBLOCK_SIZE)
             {
                 int myKeys[nMultires];
@@ -1598,13 +1583,13 @@ void histo_largenbin_step(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE
 }
 
 
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histo_kernel_largeNBins(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* blockOut, int nOut,
     int nSteps,
@@ -1637,7 +1622,7 @@ void histo_kernel_largeNBins(
     // Where do we put the results from our warp (block)?
     hash.myBlockOut = &blockOut[nOut * blockIdx.x];
 
-    int myStart = start + ((blockIdx.x * nSteps) << LBLOCK_SIZE_LOG2) + threadIdx.x;
+    INDEXT myStart = start + (INDEXT)(((blockIdx.x * nSteps) << LBLOCK_SIZE_LOG2) + threadIdx.x);
     // Assert that myStart is not out of bounds!
     int nFullSteps = nSteps >> LARGE_NBIN_CHECK_INTERVAL_LOG2;
     bool reduce = false;
@@ -1676,47 +1661,20 @@ void histo_kernel_largeNBins(
 
 #if USE_MEDIUM_PATH
 
-#if 0
-//blockAtomicOut(ourOut, locks, myOut, myKey, sumfunObj);
-template <typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline __device__
-void blockAtomicOut(OUTPUTTYPE* blockOut, char* locks, OUTPUTTYPE res, int myKey, SUMFUNTYPE sumfunObj)
-{
-    volatile char* lock = &locks[myKey];
-//    bool Iamdone = false;
-#define TMP_LOCK_MAGIC  -1
-    *lock = TMP_LOCK_MAGIC;
-    // Do atomic-part
-    while (1)
-    {
-        *lock = (char)threadIdx.x;
-        if (*lock == (char)threadIdx.x) // We won!
-        {
-          blockOut[myKey] = sumfunObj(res, blockOut[myKey] );
-          // release lock
-          *lock = TMP_LOCK_MAGIC;
-          break;
-        }
-    }
-#undef TMP_LOCK_MAGIC
-    //__syncthreads();
-}
-#endif
-
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histo_kernel_mediumNBins(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* blockOut, int nOut,
     int nSteps)
 {
 #if __CUDA_ARCH__ >= 120
     OUTPUTTYPE* ourOut = &blockOut[nOut * blockIdx.x];
-    int myStart = start + ((blockIdx.x * nSteps) << MEDIUM_BLOCK_SIZE_LOG2) + threadIdx.x;
+    INDEXT myStart = start + (INDEXT)(((blockIdx.x * nSteps) << MEDIUM_BLOCK_SIZE_LOG2) + threadIdx.x);
     bool reduce = false;
     int nSameTot = 0;
     for (int step = 0; step < nSteps - 1; step++)
@@ -1846,16 +1804,23 @@ void initKernel(OUTPUTTYPE* tmpOut, OUTPUTTYPE zeroVal, int tmpOutSize, int step
   }
 }
 
+template <histogram_type histotype, typename OUTPUTTYPE>
+static int getLargeBinTmpbufsize(int nOut, cudaDeviceProp* props)
+{
+    int nblocks;
+    int hashSizelog2 = determineHashSizeLog2(sizeof(OUTPUTTYPE), &nblocks, props);
+    dim3 block = LBLOCK_SIZE;
+    dim3 grid = nblocks;
+    return (nblocks + 1) * nOut * sizeof(OUTPUTTYPE);
+}
 
-
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, /*typename INDEXFUNTYPE,*/ typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline
+template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+static
 void callHistogramKernelLargeNBins(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     cudaDeviceProp* props, int cuda_arch, cudaStream_t stream,
     int* getTmpBufSize,
@@ -1864,16 +1829,16 @@ void callHistogramKernelLargeNBins(
 {
     int nblocks;
     int hashSizelog2 = determineHashSizeLog2(sizeof(OUTPUTTYPE), &nblocks, props);
-    int size = end - start;
+    INDEXT size = end - start;
     // Check if there is something to do actually...
-    if (size <= 0)
+    if (end <= start)
     {
       if (getTmpBufSize) getTmpBufSize = 0;
         return;
     }
     dim3 block = LBLOCK_SIZE;
     dim3 grid = nblocks;
-    int nSteps = size / ( LBLOCK_SIZE * nblocks);
+    INDEXT nSteps = size / (INDEXT)( LBLOCK_SIZE * nblocks);
     OUTPUTTYPE* tmpOut;
     //int n = nblocks;
     if (getTmpBufSize) {
@@ -1940,9 +1905,9 @@ void callHistogramKernelLargeNBins(
     {
         const dim3 block = MEDIUM_BLOCK_SIZE;
         dim3 grid = nblocks;
-        int nSteps = size / ( MEDIUM_BLOCK_SIZE * nblocks);
+        INDEXT nSteps = size / (INDEXT)( MEDIUM_BLOCK_SIZE * nblocks);
 
-        int nFullSteps = 1;
+        INDEXT nFullSteps = 1;
         if (nSteps <= 0)
         {
             nFullSteps = 0;
@@ -1954,19 +1919,19 @@ void callHistogramKernelLargeNBins(
             nFullSteps = size / ( MEDIUM_BLOCK_SIZE * nblocks * MAX_NLHSTEPS);
             nSteps = MAX_NLHSTEPS;
         }
-        for (int step = 0; step < nFullSteps; step++)
+        for (INDEXT step = 0; step < nFullSteps; step++)
         {
             histo_kernel_mediumNBins<histotype, nMultires><<<grid, block, 0, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps);
-            start += (MEDIUM_BLOCK_SIZE * nblocks * nSteps);
+            start += (MEDIUM_BLOCK_SIZE * (INDEXT)nblocks * nSteps);
         }
         size = end - start;
-        nSteps = size / ( MEDIUM_BLOCK_SIZE * nblocks);
+        nSteps = size / (INDEXT)( MEDIUM_BLOCK_SIZE * nblocks);
         if (nSteps > 0)
         {
             histo_kernel_mediumNBins<histotype, nMultires><<<grid, block, 0, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps);
-            start += (MEDIUM_BLOCK_SIZE * nblocks * nSteps);
+            start += (MEDIUM_BLOCK_SIZE * (INDEXT)nblocks * nSteps);
             size = end - start;
         }
         if (size > 0)
@@ -1981,7 +1946,7 @@ void callHistogramKernelLargeNBins(
     else
 #endif // USE_MEDIUM_PATH
     {
-        int nFullSteps = 1;
+        INDEXT nFullSteps = 1;
         if (nSteps <= 0)
         {
             nFullSteps = 0;
@@ -1990,22 +1955,22 @@ void callHistogramKernelLargeNBins(
         }
         if (nSteps > MAX_NLHSTEPS)
         {
-            nFullSteps = size / ( LBLOCK_SIZE * nblocks * MAX_NLHSTEPS);
+            nFullSteps = size / ( LBLOCK_SIZE * (INDEXT)nblocks * MAX_NLHSTEPS);
             nSteps = MAX_NLHSTEPS;
         }
         for (int step = 0; step < nFullSteps; step++)
         {
             histo_kernel_largeNBins<histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps, hashSizelog2);
-            start += (LBLOCK_SIZE * nblocks * nSteps);
+            start += (LBLOCK_SIZE * (INDEXT)nblocks * nSteps);
         }
         size = end - start;
-        nSteps = size / ( LBLOCK_SIZE * nblocks);
+        nSteps = size / ( LBLOCK_SIZE * (INDEXT)nblocks);
         if (nSteps > 0)
         {
             histo_kernel_largeNBins<histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
               input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, nSteps, hashSizelog2);
-            start += (LBLOCK_SIZE * nblocks * nSteps);
+            start += (LBLOCK_SIZE * (INDEXT)nblocks * nSteps);
             size = end - start;
         }
         if (size > 0)
@@ -2094,25 +2059,45 @@ static int determineNKeySetsLog2(size_t size_out, int nOut, cudaDeviceProp* prop
 }
 
 
+template <histogram_type histotype, typename OUTPUTTYPE>
+static int getMediumHistoTmpbufSize(int nOut, cudaDeviceProp* props, int size, int nsteps)
+{
+    const dim3 block = HBLOCK_SIZE;
+
+    dim3 grid = size / ( nsteps * HBLOCK_SIZE );
+    if (grid.x * nsteps * HBLOCK_SIZE < size)
+      grid.x++;
+
+    int n = grid.x;
+
+    // Adjust nsteps - new algorithm expects it to be correct!
+    nsteps = size / (n * HBLOCK_SIZE);
+    if (nsteps * n * HBLOCK_SIZE < size) nsteps++;
+
+    return 2 * n * nOut * sizeof(OUTPUTTYPE);
+
+}
+
 // NOTE: Output to HOST MEMORY!!! - TODO; Provide API for device memory output? Why?
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, /*typename INDEXFUNTYPE,*/ typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline
+template <histogram_type histotype, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
+static
 void callHistogramKernelImpl(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut, int nsteps,
     cudaDeviceProp* props,
     cudaStream_t stream,
-    int* getTmpBufSize,
+    size_t* getTmpBufSize,
     void* tmpBuffer,
     bool outInDev)
 {
-  int size = end - start;
+  INDEXT size = end - start;
   // Check if there is something to do actually...
-  if (size <= 0)
+  if (end <= start)
   {
       if (getTmpBufSize) *getTmpBufSize = 0;
       return;
@@ -2284,13 +2269,14 @@ bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props, int cuda_a
 }
 
 
-template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <bool lastSteps, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 static inline __device__
 void histoKernel_smallBinStep(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int myStart, int end,
+    INDEXT myStart, INDEXT end,
     OUTPUTTYPE* mySHBins)
 {
     int myKeys[nMultires];
@@ -2320,13 +2306,15 @@ void histoKernel_smallBinStep(
         }
     }
 }
-template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <bool lastSteps, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histoKernel_smallBin(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* blockOut, int nOut, int maxblocks,
     int nSteps)
@@ -2338,7 +2326,7 @@ void histoKernel_smallBin(
     OUTPUTTYPE* allbins = (OUTPUTTYPE*)&(*cudahistogram_allbinstmp);
     OUTPUTTYPE* mySHBins = &allbins[threadIdx.x];
     OUTPUTTYPE* ourOut = &blockOut[nOut * blockIdx.x];
-    int myStart = start + ((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x;
+    INDEXT myStart = start + (INDEXT)((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + (INDEXT)threadIdx.x;
     for (int bin = 0; bin < nOut /*- nLocVars*/; bin++)
         mySHBins[bin << SMALL_BLOCK_SIZE_LOG2] = zero;
     // Run loops - unroll 8 steps manually
@@ -2415,13 +2403,15 @@ static inline __device__
 void intToResult(int resultin, OUTPUTTYPE& resultout){ ; }
 
 
-template <bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <bool lastSteps, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 static inline __device__
 void histoKernel_smallBinByteOneStep(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int myStart, int end,
+    INDEXT myStart, INDEXT end,
     volatile unsigned char* mySHBins,
     OUTPUTTYPE zero
     )
@@ -2463,13 +2453,15 @@ void histoKernel_smallBinByteOneStep(
 
 
 
-template <histogram_type histotype, bool lastSteps, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, bool lastSteps, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histoKernel_smallBinByte(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* blockOut, int nOut, int maxblocks,
     int nSteps)
@@ -2525,7 +2517,7 @@ void histoKernel_smallBinByte(
     OUTPUTTYPE* resultbins = (OUTPUTTYPE*)(&allbins2[padNOut << SMALL_BLOCK_SIZE_LOG2]);
 #endif
 
-    int myStart = start + ((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x;
+    INDEXT myStart = start + (INDEXT)(((blockIdx.x * nSteps) << SMALL_BLOCK_SIZE_LOG2) + threadIdx.x);
 
     // Run loops
     //int nFullLoops = nSteps >> 7;
@@ -2662,16 +2654,27 @@ void histoKernel_smallBinByte(
 #endif
 }
 
+template <histogram_type histotype, typename OUTPUTTYPE>
+static int getSmallBinBufSize(int nOut, cudaDeviceProp* props)
+{
+    int maxblocks = props->multiProcessorCount * 3;
 
+    maxblocks *= 2;
+    if (nOut < 200) maxblocks *= 4;
+    maxblocks *= 4;
 
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, /*typename INDEXFUNTYPE,*/ typename SUMFUNTYPE, typename OUTPUTTYPE>
-static inline
+    return (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE);
+}
+
+template <histogram_type histotype, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
+static
 void callSmallBinHisto(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
-    int start,
-    int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero,
     OUTPUTTYPE* out, int nOut,
     cudaDeviceProp* props,
@@ -2681,8 +2684,8 @@ void callSmallBinHisto(
     void* tmpBuffer,
     bool outInDev)
 {
-    int size = end - start;
-    if (size <= 0)
+    INDEXT size = end - start;
+    if (end <= start)
     {
         if (getTmpBufSize) *getTmpBufSize = 0;
         return;
@@ -2713,6 +2716,10 @@ void callSmallBinHisto(
         tmpOut = (OUTPUTTYPE*)tmpBuffer;
     else
         cudaMalloc((void**)&tmpOut, (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));
+#if H_ERROR_CHECKS
+    assert(getSmallBinBufSize<histotype, OUTPUTTYPE>(nOut, props) >=
+            (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));
+#endif
 //    cudaMemset(tmpOut, 0, sizeof(OUTPUTTYPE) * nOut * (maxblocks+1));
     {
       #define IBLOCK_SIZE_LOG2    7
@@ -2895,7 +2902,7 @@ void detectCudaArchKernel(int* res)
         *res = result;
 }
 
-static inline
+static
 int DetectCudaArch(void)
 {
     // The only way to know from host-code, which device architecture our kernels have been generated
@@ -2919,14 +2926,15 @@ int DetectCudaArch(void)
 }
 
 
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 cudaError_t
 callHistogramKernel(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int start, int end,
+    INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
     cudaStream_t stream, void* tmpBuffer)
@@ -2962,14 +2970,14 @@ callHistogramKernel(
         // TODO: Silly magic number
         int max = HBLOCK_SIZE * 1024 * nsteps;
         bool done = false;
-        for (int i0 = start; !done; i0 += max)
+        for (INDEXT i0 = start; !done; i0 += max)
         {
-            int i1 = i0 + max;
+            INDEXT i1 = i0 + max;
             if (i1 >= end || i1 < start)
             {
                 i1 = end;
                 done = true;
-                int size = i1 - i0;
+                INDEXT size = i1 - i0;
                 int nblocks = size / (HBLOCK_SIZE * nsteps);
                 if (HBLOCK_SIZE * nblocks * nsteps < size) nblocks++;
                 if (nblocks < props.multiProcessorCount * 8 && nsteps > 1)
@@ -2985,16 +2993,16 @@ callHistogramKernel(
     return cudaSuccess;
 }
 
-template <typename nDimIndexFun, int nDim, typename USERINPUTTYPE>
+template <typename nDimIndexFun, int nDim, typename USERINPUTTYPE, typename INDEXT>
 class wrapHistoInput
 {
 public:
     nDimIndexFun userIndexFun;
-    int starts[nDim];
+    INDEXT starts[nDim];
     //int ends[nDim];
-    int sizes[nDim];
+    INDEXT sizes[nDim];
     __host__ __device__
-    void operator() (USERINPUTTYPE input, int i, int* result_index, int* results, int nresults) const {
+    void operator() (USERINPUTTYPE input, INDEXT i, int* result_index, int* results, int nresults) const {
         int coords[nDim];
         int tmpi = i;
   #pragma unroll
@@ -3005,8 +3013,8 @@ public:
             // newI = 12 345 / 100 = 123,    offset = 12 345 - 12 300 = 45 (this is our second coordinate!),
             // newI = 123 / 1000 = 0,        offset = 123 - 0 = 123 (this is our last coordinate!)
             // Result = [123, 45, 6]
-            int newI = tmpi / sizes[d];
-            int offset = tmpi - newI * sizes[d];
+            INDEXT newI = tmpi / sizes[d];
+            INDEXT offset = tmpi - newI * sizes[d];
             coords[d] = starts[d] + offset;
             tmpi = newI;
         }
@@ -3015,28 +3023,24 @@ public:
     }
 };
 
-/*template <int nDim>
-struct wraphistogram_nDimXform
-{
-};*/
 
 
-
-template <histogram_type histotype, int nMultires, int nDim, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires, int nDim,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 cudaError_t
 callHistogramKernelNDim(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int* starts, int* ends,
+    INDEXT* starts, INDEXT* ends,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
     cudaStream_t stream, void* tmpBuffer)
 {
-    wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE> wrapInput;
-    int start = 0;
-    int size = 1;
+    wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE,INDEXT> wrapInput;
+    INDEXT start = 0;
+    INDEXT size = 1;
     for (int d = 0; d < nDim; d++)
     {
         wrapInput.starts[d] = starts[d];
@@ -3050,26 +3054,27 @@ callHistogramKernelNDim(
         if (ends[d] <= starts[d]) return cudaSuccess;
     }
     wrapInput.userIndexFun = xformObj;
-    int end = start + size;
+    INDEXT end = start + size;
     return callHistogramKernel<histotype, nMultires>
         (input, wrapInput, sumfunObj, start, end, zero, out, nOut, outInDev, stream, tmpBuffer);
 }
 
-template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
+template <histogram_type histotype, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
 cudaError_t
 callHistogramKernel2Dim(
     INPUTTYPE input,
     TRANSFORMFUNTYPE xformObj,
-    /*INDEXFUNTYPE indexfunObj,*/
     SUMFUNTYPE sumfunObj,
-    int x0, int x1,
-    int y0, int y1,
+    INDEXT x0, INDEXT x1,
+    INDEXT y0, INDEXT y1,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
     cudaStream_t stream, void* tmpBuffer)
 {
-    int starts[2] = { x0, y0 };
-    int ends[2] = { x1, y1 };
+    INDEXT starts[2] = { x0, y0 };
+    INDEXT ends[2] = { x1, y1 };
     return callHistogramKernelNDim<histotype, nMultires, 2>
         (input, xformObj, sumfunObj, starts, ends, zero, out, nOut, outInDev, stream, tmpBuffer);
 
@@ -3131,7 +3136,6 @@ struct histogram_dummySum
 template <histogram_type histotype, typename OUTPUTTYPE>
 int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 {
-    OUTPUTTYPE* out = NULL;
     int result = 0;
     int devId;
     cudaDeviceProp props;
@@ -3141,19 +3145,13 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
     cudaErr = cudaGetDeviceProperties( &props, devId );
     if (cudaErr != 0) return cudaErr;
     int cuda_arch = DetectCudaArch();
-    struct histogram_dummySum<int> sumfunObj;
-    struct histogram_dummyXform<uint4, int> xformfunObj;
     if (smallBinLimit<histotype>(nOut, zero, &props, cuda_arch))
     {
-        callSmallBinHisto<histotype, 1>(
-            (uint4*)&zero, xformfunObj, sumfunObj, 0, 1,
-            zero, out, nOut, &props, cuda_arch, 0, &result, NULL, false);
+        result = getSmallBinBufSize<histotype, OUTPUTTYPE>(nOut, &props);
     }
     else if (!binsFitIntoShared(nOut, zero, &props, cuda_arch))
     {
-        callHistogramKernelLargeNBins<histotype, 1>(
-            (uint4*)&zero, xformfunObj, sumfunObj, 0, 1, zero, out,
-            nOut, &props, cuda_arch, 0, &result, NULL, false);
+        result = getLargeBinTmpbufsize<histotype, OUTPUTTYPE>(nOut, &props);
     }
     else
     {
@@ -3167,10 +3165,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
             nsteps = size / (HBLOCK_SIZE * props.multiProcessorCount * 8);
             if (((HBLOCK_SIZE * nsteps * props.multiProcessorCount * 8)) < size) nsteps++;
         }
-        callHistogramKernelImpl<histotype, 1>(
-            (uint4*)&zero, xformfunObj, sumfunObj, 0, size, zero, out,
-            nOut, nsteps, &props, 0, &result, NULL, false);
-
+        result = getMediumHistoTmpbufSize<histotype, OUTPUTTYPE>(nOut, &props, size, nsteps);
     }
     return result;
 }

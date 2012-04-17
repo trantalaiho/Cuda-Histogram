@@ -24,16 +24,16 @@
  *
  */
 
-#define TESTMAXIDX   3355      // 16 keys / indices
+#define TESTMAXIDX   6555      // 16 keys / indices
 #define TEST_IS_POW2 0
 //#define TEST_SIZE (156620)   // 1000 million inputs
 #define TEST_SIZE 0
-#define NRUNS 500          // Repeat 100 times => 100 gigainputs
+#define NRUNS 550          // Repeat 100 times => 100 gigainputs
 #define START_INDEX	2
 #define NSTRESS_RUNS    NRUNS
 #define START_NBINS	1
 #define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-#define NBIN_INC	79
+#define NBIN_INC	69
 
 #include <stdio.h>
 #include "cuda_histogram.h"

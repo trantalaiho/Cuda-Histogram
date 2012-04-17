@@ -206,7 +206,7 @@ callHistogramKernel2Dim(
     #include <stdio.h>
 #endif
 
-#define HBLOCK_SIZE_LOG2    5
+#define HBLOCK_SIZE_LOG2    7
 #define HBLOCK_SIZE         (1 << HBLOCK_SIZE_LOG2) // = 32
 
 #define LBLOCK_SIZE_LOG2    5
@@ -233,6 +233,8 @@ callHistogramKernel2Dim(
 
 #define STRATEGY_CHECK_INTERVAL_LOG2    7
 #define STRATEGY_CHECK_INTERVAL         (1 << STRATEGY_CHECK_INTERVAL_LOG2)
+
+#define HISTOGRAM_DEGEN_LIMIT   20
 
 
 #define HASH_COLLISION_STEPS    2
@@ -263,7 +265,6 @@ const int numActiveUpperLimit = 24;
 #else
 #   define USE_BALLOT_HISTOGRAM    0
 #endif
-#define USE_ATOMIC_ADD          1
 
 #ifndef __device__
 #define __device__
@@ -512,6 +513,69 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
     }
 }
 
+#define FREE_MUTEX_ID   0xffeecafe
+#define TAKE_WARP_MUTEX(ID) do { \
+                                int warpIdWAM = threadIdx.x / 32; \
+                                __shared__ volatile int lockVarWarpAtomicMutex;\
+                                bool doneWAM = false;\
+                                bool allDone = false; \
+                                    while(!allDone){ \
+                                        __syncthreads(); \
+                                        if (!doneWAM) lockVarWarpAtomicMutex = warpIdWAM; \
+                                        __syncthreads(); \
+                                        if (lockVarWarpAtomicMutex == FREE_MUTEX_ID) allDone = true; \
+                                        if (lockVarWarpAtomicMutex == warpIdWAM){ /* We Won */
+
+                                            // User code comes here
+
+#define GIVE_WARP_MUTEX(ID)                 doneWAM = true; \
+                                            lockVarWarpAtomicMutex = FREE_MUTEX_ID; \
+                                        } \
+                                    } \
+                            } while(0)
+
+// NOTE: Init must be called from divergent-free code (or with exited warps)
+#define INIT_WARP_MUTEX2(MUTEX) do { MUTEX = FREE_MUTEX_ID; __syncthreads(); } while(0)
+#if 0 && __CUDA_ARCH__ >= 120 // TODO: NOT WORKING THIS CODEPATH - find out why
+#define TAKE_WARP_MUTEX2(MUTEX) do { \
+                                int warpIdWAM = 1000000 + threadIdx.x / 32; \
+                                bool doneWAM = false;\
+                                    while(!doneWAM){ \
+                                        int old = -2; \
+                                        if (threadIdx.x % 32 == 0) \
+                                            old = atomicCAS(&MUTEX, FREE_MUTEX_ID, warpIdWAM); \
+                                        if (__any(old == FREE_MUTEX_ID)){ /* We Won */
+
+                                            // User code comes here
+
+#define GIVE_WARP_MUTEX2(MUTEX)             doneWAM = true; \
+                                            atomicExch(&MUTEX, FREE_MUTEX_ID); \
+                                        } \
+                                    } \
+                            } while(0)
+#else
+#define TAKE_WARP_MUTEX2(MUTEX) do { \
+                                int warpIdWAM = 1000000 + threadIdx.x / 32; \
+                                bool doneWAM = false;\
+                                bool allDone = false; \
+                                    while(!allDone){ \
+                                        __syncthreads(); \
+                                        if (!doneWAM) MUTEX = warpIdWAM; \
+                                        __syncthreads(); \
+                                        if (MUTEX == FREE_MUTEX_ID) allDone = true; \
+                                        if (MUTEX == warpIdWAM){ /* We Won */
+
+                                            // User code comes here
+
+#define GIVE_WARP_MUTEX2(MUTEX)             doneWAM = true; \
+                                            MUTEX = FREE_MUTEX_ID; \
+                                        } \
+                                    } \
+                            } while(0)
+#endif
+
+
+
 
 #if USE_BALLOT_HISTOGRAM
 
@@ -557,9 +621,9 @@ bool ballot_makeUnique(
 
   unsigned int mymask;
 
-  #if HBLOCK_SIZE != 32
+/*  #if HBLOCK_SIZE != 32
   #error Please use threadblocks of 32 threads
-  #endif
+  #endif*/
   //startKey = s_keys[startIndex];
   // First dig out for each thread who are the other threads that have the same key as us...
   //int i = 0;
@@ -604,7 +668,7 @@ bool ballot_makeUnique(
   {
     // Compute the left side of the mask and the right side. rmask first will contain our thread index, but
     // we zero it out immediately
-    unsigned int lmask = (mymask >> threadIdx.x) << threadIdx.x;
+    unsigned int lmask = (mymask >> (threadIdx.x & 31)) << (threadIdx.x & 31);
     int IamNth = __popc(lmask) - 1;
     bool Iwrite = IamNth == 0;
     if (histotype == histogram_atomic_inc)
@@ -621,6 +685,7 @@ bool ballot_makeUnique(
 
         int nextIdx = 31 - __clz(rmask);
 
+        s_vals[(threadIdx.x & 31)] = *myOut;
         //if (myKey == 0) printf("tid = %02d, IamNth = %02d, mask = 0x%08x, rmask = 0x%08x \n", threadIdx.x, IamNth, mymask, rmask);
         //bool done = __all(nextIdx < 0);
         // TODO: Unroll 5?
@@ -638,7 +703,7 @@ bool ballot_makeUnique(
             if ((IamNth & 0x3) == 2)
             {
               // if (myKey == 0) printf("Tid %02d, store\n", threadIdx.x);
-              s_vals[threadIdx.x] = *myOut;
+              s_vals[(threadIdx.x & 31)] = *myOut;
             }
           }
           // Now the beautiful part: Kill every other bit in the rmask bitfield. How, you ask?
@@ -652,13 +717,50 @@ bool ballot_makeUnique(
           //printf("i = %d\n", i);
         }
         // And voila, we are done - write out the result:
-        return Iwrite;
+        return Iwrite && (myKey >= 0);
     }
   }
 }
 #endif
 
-#if USE_ATOMIC_ADD
+
+
+template <bool laststeps, typename SUMFUNTYPE, typename OUTPUTTYPE>
+static inline __device__
+void myAtomicWarpAdd(OUTPUTTYPE* addr, OUTPUTTYPE val, volatile int* keyAddr, SUMFUNTYPE sumfunObj, bool Iwrite, int* warpmutex)
+{
+    // Taken from http://forums.nvidia.com/index.php?showtopic=72925
+    // This is a tad slow, but allows arbitrary operation
+    // For writes of 16 bytes or less AtomicCAS could be faster
+    // (See CUDA programming guide)
+    TAKE_WARP_MUTEX(0);
+    //__shared__ int warpmutex;
+    //INIT_WARP_MUTEX2(*warpmutex);
+    //TAKE_WARP_MUTEX2(*warpmutex);
+    bool write = Iwrite;
+#define MU_TEMP_MAGIC 0xffffaaaa
+    *keyAddr = MU_TEMP_MAGIC;
+    while (1)
+    {
+        // Vote whose turn is it - remember, one thread does succeed always!:
+        if (write) *keyAddr = threadIdx.x;
+        if (*keyAddr == MU_TEMP_MAGIC)
+            break;
+        if (*keyAddr == threadIdx.x) // We won!
+        {
+            // Do arbitrary atomic op:
+            *addr = sumfunObj(*addr, val);
+            write = false;
+            *keyAddr = MU_TEMP_MAGIC;
+        }
+    }
+    GIVE_WARP_MUTEX(0);
+    //GIVE_WARP_MUTEX2(*warpmutex);
+#undef MU_TEMP_MAGIC
+}
+
+
+
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 void myAtomicAdd(OUTPUTTYPE* addr, OUTPUTTYPE val, volatile int* keyAddr, SUMFUNTYPE sumfunObj)
@@ -768,17 +870,15 @@ void myAtomicAddStats(OUTPUTTYPE* addr, OUTPUTTYPE val, volatile int* keyAddr, S
     }
 }
 
-#endif
+
 
 // TODO: Make unique within one warp?
 template<histogram_type histotype, bool checkNSame, typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
 bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj, int* keys, OUTPUTTYPE* outputs)
 {
-    keys[threadIdx.x] = myKey;
+    keys[(threadIdx.x & 31)] = myKey;
 #if  USE_BALLOT_HISTOGRAM
-    if (histotype != histogram_atomic_inc)
-        outputs[threadIdx.x] = *res;
     return ballot_makeUnique<histotype, checkNSame>(sumfunObj, myKey, res, outputs, keys, nSame);
 #else
     {
@@ -862,6 +962,31 @@ void wrapAtomicAdd2(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFu
 }
 
 
+// Special case for floats (atomicAdd works only from __CUDA_ARCH__ 200 and up)
+template <bool laststeps, typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicAdd2Warp(float* addr, float val, int* key, SUMFUNTYPE sumFunObj, bool Iwrite, int* warpmutex)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 200
+  if (Iwrite) atomicAdd(addr, val);
+#else
+  myAtomicWarpAdd<laststeps>(addr, val, key, sumFunObj, Iwrite, warpmutex);
+#endif
+}
+
+template <bool laststeps, typename SUMFUNTYPE,typename OUTPUTTYPE>
+static inline __device__
+void wrapAtomicAdd2Warp(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFunObj, bool Iwrite, int* warpmutex)
+{
+  if (Iwrite) atomicAdd(addr, val);
+}
+
+
+
+
+
+
 template <typename OUTPUTTYPE, typename SUMFUNTYPE>
 static inline __device__
 void wrapAtomicAdd(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFunObj)
@@ -900,308 +1025,48 @@ void wrapAtomicInc(int* addr, int* key, SUMFUNTYPE sumFunObj)
 
 
 
-template <histogram_type histotype, int nBinSetslog2, int nMultires, bool checkStrategy, bool reduce, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+
+
+template <bool laststeps, typename OUTPUTTYPE, typename SUMFUNTYPE>
 static inline __device__
-void histogramKernel_stepImpl(
-    INPUTTYPE input,
-    TRANSFORMFUNTYPE xformObj,
-    SUMFUNTYPE sumfunObj,
-    INDEXT end,
-    OUTPUTTYPE zero,
-    int nOut, INDEXT& startidx, bool* reduceOut, int nStepsRem,
-    OUTPUTTYPE* bins, int* keys, int nthstep, int* nSameTot, OUTPUTTYPE* rOut)
+void wrapAtomicAddWarp(OUTPUTTYPE* addr, OUTPUTTYPE val, int* key, SUMFUNTYPE sumFunObj, bool Iwrite, int* warpmutex)
 {
-  if (laststep)
-  {
-    for (int step = 0; step < nStepsRem; step++, startidx += HBLOCK_SIZE)
-    {
-        int myKeys[nMultires];
-        OUTPUTTYPE res[nMultires];
-        bool last = false;
-        {
-            INDEXT idx = (INDEXT)threadIdx.x + startidx;
-            if (idx < end)
-            {
-                xformObj(input, idx, &myKeys[0], &res[0], nMultires);
-            }
-            else
-            {
-                int tmpbin = 0;
-                if (histotype == histogram_atomic_inc)
-                    tmpbin = -1;
-#pragma unroll
-                for (int resid = 0; resid < nMultires; resid++)
-                {
-                    res[resid] = zero;
-                    myKeys[resid] = tmpbin;
-                }
-            }
-            if (HBLOCK_SIZE + startidx >= end)
-              last = true;
-        }
-        // Now what do we do
-        // TODO: How to avoid bank-conflicts? Any way to avoid?
-        // Each thread should always (when possible) use just one bank
-        // Therefore if we put keyIndex = Key * 32, we are always on the
-        // same bank with each thread. To get bank-conflict free operation,
-        // we would need 32 binsets, ie private bins for each thread.
-        // But we do not have so many binsets - we have only
-        // (1 << nBinSetslog2) binsets (1,2,4,8,16,32)
-        // => nBinsets x nOut, bins in total. Therefore the best we can do,
-        // is put keyindex = myKey x nBinsets + binSet
-        //reduce = true;
-        //TODO: unroll loops possible??
-//#pragma unroll
-        int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2Warp<laststeps>(addr, val, key, sumFunObj, Iwrite, warpmutex);
+#else
+  myAtomicWarpAdd<laststeps>(addr, val, key, sumFunObj, Iwrite, warpmutex);
+#endif
+}
+template <bool laststeps, typename OUTPUTTYPE, typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicIncWarp(OUTPUTTYPE* addr, int* key, SUMFUNTYPE sumFunObj, bool Iwrite, int* warpmutex)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2Warp<laststeps>((int*)addr, 1, key, sumFunObj, Iwrite, warpmutex);
+#else
+  //myAtomicAdd((int*)addr, 1, key, sumFunObj);
+#endif
+}
 
-#define ADD_ONE_RESULT(RESID, CHECK, NSAME)                                                                                                 \
-    if (RESID < nMultires) do {                                                                                                             \
-        int keyIndex = (myKeys[(RESID % nMultires)] << nBinSetslog2) + binSet;                                                              \
-        if (reduce || last || CHECK) {                                                                                                      \
-            bool Iwrite = reduceToUnique<histotype, CHECK>(&res[(RESID % nMultires)], myKeys[(RESID % nMultires)], NSAME, sumfunObj, keys, rOut); \
-            if (Iwrite) bins[keyIndex] = sumfunObj(bins[keyIndex], res[(RESID % nMultires)]);                                               \
-        } else {                                                                                                                            \
-          if (histotype == histogram_generic)                                                                                               \
-            myAtomicAdd(&bins[keyIndex], res[(RESID % nMultires)], &keys[keyIndex], sumfunObj);                                             \
-          else if (histotype == histogram_atomic_add)                                                                                       \
-            wrapAtomicAdd(&bins[keyIndex], *(&res[(RESID % nMultires)]), &keys[keyIndex], sumfunObj);                                       \
-          else  if (histotype == histogram_atomic_inc)                                                                                      \
-            wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);                                                                                   \
-          else{                                                                                                                             \
-            myAtomicAdd(&bins[keyIndex], res[(RESID % nMultires)], &keys[keyIndex], sumfunObj);                                             \
-          }                                                                                                                                 \
-        }                                                                                                                                   \
-    } while(0)
-
-        ADD_ONE_RESULT(0, false, NULL);
-        ADD_ONE_RESULT(1, false, NULL);
-        ADD_ONE_RESULT(2, false, NULL);
-        ADD_ONE_RESULT(3, false, NULL);
-        // NOTE: Had to manually unroll loop, as for some reason pragma unroll didn't work
-        for (int resid = 4; resid < nMultires; resid++)
-        {
-            int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
-            int keyIndex = (myKeys[resid] << nBinSetslog2) + binSet;
-            if (reduce || last)
-            {
-                // TODO: Static decision
-                bool Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, keys, rOut);
-                if (Iwrite)
-                    bins[keyIndex] = sumfunObj(bins[keyIndex], res[resid]);
-            }
-            else
-            {
-                if (histotype == histogram_generic)
-                  myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-                else if (histotype == histogram_atomic_add)
-                  wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
-                else if (histotype == histogram_atomic_inc)
-                  //atomicInc(&bins[keyIndex], 0xffffffffu);
-                  wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
-                else{
-                  //#error Invalid histotype! TODO How to handle??
-                  myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-                }
-            }
-        }
-      }
-  }
-  else
-  {
-    if (checkStrategy)
-    {
-      int myKeys[nMultires];
-      OUTPUTTYPE res[nMultires];
-      INDEXT idx = (INDEXT)threadIdx.x + startidx;
-      xformObj(input, idx, &myKeys[0], &res[0], nMultires);
-      // Now what do we do
-      int nSame = 0;
-      // See keyIndex-reasoning above
-      int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
-      bool last = false;
-
-      ADD_ONE_RESULT(0, true, &nSame);
-      ADD_ONE_RESULT(1, false, NULL);
-      ADD_ONE_RESULT(2, false, NULL);
-      ADD_ONE_RESULT(3, false, NULL);
-
-//#pragma unroll
-      for (int resid = 4; resid < nMultires; resid++)
-      {
-          int keyIndex = (myKeys[resid] << nBinSetslog2) + binSet;
-          if (reduce)
-          {
-              // TODO: Static decision
-              bool Iwrite;
-              Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, keys, rOut);
-              if (Iwrite)
-                  bins[keyIndex] = sumfunObj(bins[keyIndex], res[resid]);
-          }
-          else
-          {
-              if (histotype == histogram_generic)
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-              else if (histotype == histogram_atomic_add)
-                wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
-              else if (histotype == histogram_atomic_inc)
-                //atomicInc(&bins[keyIndex], 0xffffffffu);
-                wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
-              else{
-                //#error Invalid histotype! TODO How to handle??
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-              }
-              nSame = (nSame) << nBinSetslog2;
-          }
-      }
-      checkStrategyFun(reduceOut, nSame, *nSameTot, nthstep, nBinSetslog2);
-      *nSameTot += nSame;
-
-      // Remember to increase the starting index:
-      startidx += HBLOCK_SIZE;
-    }
-    else
-    {
-      // Run only STRATEGY_CHECK_INTERVAL - 1 times
-      //int startIdxLim = startidx + (HBLOCK_SIZE << STRATEGY_CHECK_INTERVAL_LOG2) - HBLOCK_SIZE;
-      for (int step = 0; step < STRATEGY_CHECK_INTERVAL - 1; step++, startidx += HBLOCK_SIZE)
-      {
-        bool last = false;
-        int myKeys[nMultires];
-        OUTPUTTYPE res[nMultires];
-        INDEXT idx = (INDEXT)threadIdx.x + startidx;
-        xformObj(input, idx, &myKeys[0], &res[0], nMultires);
-        // Now what do we do
-        //reduce = true;
-        int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
-        ADD_ONE_RESULT(0, false, NULL);
-        ADD_ONE_RESULT(1, false, NULL);
-        ADD_ONE_RESULT(2, false, NULL);
-        ADD_ONE_RESULT(3, false, NULL);
-//#pragma unroll
-        for (int resid = 4; resid < nMultires; resid++)
-        {
-            int keyIndex = (myKeys[resid] << nBinSetslog2) + binSet;
-
-            if (reduce)
-            {
-              // TODO: Static decision
-              bool Iwrite = reduceToUnique<histotype, false>(&res[resid], myKeys[resid], NULL, sumfunObj, keys, rOut);
-              if (Iwrite)
-                  bins[keyIndex] = sumfunObj(bins[keyIndex], res[resid]);
-            }
-            else
-            {
-              // TODO: How to avoid bank-conflicts? Any way to avoid?
-              if (histotype == histogram_generic)
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-              else if (histotype == histogram_atomic_add)
-                wrapAtomicAdd(&bins[keyIndex], *(&res[resid]), &keys[keyIndex], sumfunObj);
-              else  if (histotype == histogram_atomic_inc)
-                //atomicInc(&bins[keyIndex], 0xffffffffu);
-                wrapAtomicInc(&bins[keyIndex], &keys[keyIndex], sumfunObj);
-              else{
-                //#error Invalid histotype! TODO How to handle??
-                myAtomicAdd(&bins[keyIndex], res[resid], &keys[keyIndex], sumfunObj);
-                }
-            }
-        }
-      }
-    }
-  }
-#undef ADD_ONE_RESULT
+template <bool laststeps, typename SUMFUNTYPE>
+static inline __device__
+void wrapAtomicIncWarp(int* addr, int* key, SUMFUNTYPE sumFunObj, bool Iwrite, int* warpmutex)
+{
+    //*addr = val;
+#if __CUDA_ARCH__ >= 120
+  wrapAtomicAdd2Warp<laststeps>(addr, 1, key, sumFunObj, Iwrite, warpmutex);
+#else
+  myAtomicWarpAdd<laststeps>(addr, 1, key, sumFunObj, Iwrite, warpmutex);
+#endif
 }
 
 
-template <int nBinSetslog2, histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
-__global__
-void histogramKernel_sharedbins_new(
-    INPUTTYPE input,
-    TRANSFORMFUNTYPE xformObj,
-    SUMFUNTYPE sumfunObj,
-    INDEXT start, INDEXT end,
-    OUTPUTTYPE zero,
-    OUTPUTTYPE* blockOut, int nOut,
-    int outStride,
-    int nSteps)
-{
-  extern __shared__ int cudahistogram_binstmp[];
-  OUTPUTTYPE* bins = (OUTPUTTYPE*)&(*cudahistogram_binstmp);
 
-  int* keys = (int*)&bins[(nOut << nBinSetslog2)];
-  OUTPUTTYPE* redOut = (OUTPUTTYPE*)&keys[nOut];
-  const int nBinSets = 1 << nBinSetslog2;
-  // Reset all bins to zero...
-  for (int j = 0; j < ((nOut << nBinSetslog2) >> HBLOCK_SIZE_LOG2) + 1; j++)
-  {
-    int bin = (j << HBLOCK_SIZE_LOG2) + threadIdx.x;
-    if (bin < (nOut << nBinSetslog2)){
-        bins[bin] = zero;
-    }
-  }
-  bool reduce = false;
-  int outidx = blockIdx.x;
-  INDEXT startidx = (INDEXT)(outidx * nSteps) * HBLOCK_SIZE + start;
 
-  int nSameTot = 0;
 
-/*  template <int nBinSetslog2, bool checkStrategy, bool reduce, bool laststep, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE>
-  void histogramKernel_stepImpl(INPUTTYPE input, TRANSFORMFUNTYPE xformObj, SUMFUNTYPE sumfunObj, int start, int end,OUTPUTTYPE zero,
-      int nOut, int startidx, bool* reduceOut, int nStepsRem,OUTPUTTYPE* bins, int* keys, int nthstep, int* nSameTot)*/
 
-  // NOTE: Last block may need to adjust number of steps to not run over the end
-  if (blockIdx.x == gridDim.x - 1)
-  {
-    INDEXT locsize = (end - startidx);
-    nSteps = (locsize >> HBLOCK_SIZE_LOG2);
-    if (nSteps << HBLOCK_SIZE_LOG2 < locsize)
-      nSteps++;
-  }
-
-  //int nFullSpins = nSteps >> STRATEGY_CHECK_INTERVAL_LOG2;
-  int spin = 0;
-  for (spin = 0; spin < ((nSteps-1) >> STRATEGY_CHECK_INTERVAL_LOG2); spin++)
-  {
-    // Check strategy first
-    histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, true, false, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
-      (input, xformObj, sumfunObj, end, zero, nOut, startidx, &reduce, 0, bins, keys, spin << STRATEGY_CHECK_INTERVAL_LOG2, &nSameTot, redOut);
-    // Then use that strategy to run loops
-    if (reduce) {
-      histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, true, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
-        (input, xformObj, sumfunObj, end, zero, nOut, startidx, &reduce, 0, bins, keys, spin << STRATEGY_CHECK_INTERVAL_LOG2 + 1, &nSameTot, redOut);
-    } else {
-      histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, false, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
-        (input, xformObj, sumfunObj, end, zero, nOut, startidx, &reduce, 0, bins, keys, spin << STRATEGY_CHECK_INTERVAL_LOG2 + 1, &nSameTot, redOut);
-    }
-  }
-  int nStepsRemaining = nSteps - (spin << STRATEGY_CHECK_INTERVAL_LOG2);
-  if (nStepsRemaining > 0)
-  {
-    if (reduce) {
-      histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, true, true, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
-            (input, xformObj, sumfunObj, end, zero, nOut, startidx, &reduce, nStepsRemaining, bins, keys, spin << STRATEGY_CHECK_INTERVAL_LOG2 + 1, &nSameTot, redOut);
-    } else {
-      histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, false, true, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
-            (input, xformObj, sumfunObj, end, zero, nOut, startidx, &reduce, nStepsRemaining, bins, keys, spin << STRATEGY_CHECK_INTERVAL_LOG2 + 1, &nSameTot, redOut);
-    }
-  }
-  // Finally put together the bins
-  for (int j = 0; j < (nOut >> HBLOCK_SIZE_LOG2) + 1; j++) {
-    int key = (j << HBLOCK_SIZE_LOG2) + threadIdx.x;
-    if (key < nOut)
-    {
-      OUTPUTTYPE res = bins[key << nBinSetslog2];
-      //int tmpBin = bin;
-      for (int k = 1; k < nBinSets; k++)
-      {
-          //tmpBin += nOut;
-          res = sumfunObj(res, bins[(key << nBinSetslog2) + k]);
-      }
-        //printf("tid:%02d, write out bin: %02d, \n", threadIdx.x, bin);
-      blockOut[key * outStride + outidx] = res;
-    }
-  }
-
-}
 
 
 // TODO: Consider the following:
@@ -2059,26 +1924,279 @@ static int determineNKeySetsLog2(size_t size_out, int nOut, cudaDeviceProp* prop
 }
 
 
-template <histogram_type histotype, typename OUTPUTTYPE>
-static int getMediumHistoTmpbufSize(int nOut, cudaDeviceProp* props, int size, int nsteps)
+
+
+
+#if __CUDA_ARCH__ >= 200
+
+
+template <int nMultires>
+static inline __device__
+bool checkForReduction (int* myKeys, int* rkeys)
 {
-    const dim3 block = HBLOCK_SIZE;
+    // Idea - if there is a large number of degenerate entries then we don't need to check them all for degeneracy
+    // TODO: Implement the wonderful idea
+    //return ((threadIdx.x >> 5) & 3) < 3;
+#if 1
+    bool myKeyDegenerate;
+    //TAKE_WARP_MUTEX(0);
+    rkeys[threadIdx.x & 31] = myKeys[0];
+    // Check two thirds
+    myKeyDegenerate =
+        (myKeys[0] == (rkeys[(threadIdx.x + 1) & 31]))
+	/*||
+        (myKeys[0] == (rkeys[(threadIdx.x + 8) & 31]))*/;
+    //GIVE_WARP_MUTEX(0);
+    unsigned int degenMask = __ballot(myKeyDegenerate);
+    // Estimate number of degenerate keys - if all are degenerate, the estimate is accurate
+    int nDegen = __popc(degenMask);
+    if (nDegen > HISTOGRAM_DEGEN_LIMIT)
+        return true;
+    else
+        return false;
+#endif
+}
+#endif
 
-    dim3 grid = size / ( nsteps * HBLOCK_SIZE );
-    if (grid.x * nsteps * HBLOCK_SIZE < size)
-      grid.x++;
 
-    int n = grid.x;
 
-    // Adjust nsteps - new algorithm expects it to be correct!
-    nsteps = size / (n * HBLOCK_SIZE);
-    if (nsteps * n * HBLOCK_SIZE < size) nsteps++;
+template <histogram_type histotype, int nBinSetslog2, int nMultires, bool laststeps, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+static inline __device__
+void histogramKernel_stepImpl(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT end,
+    OUTPUTTYPE zero,
+    int nOut, INDEXT startidx,
+    OUTPUTTYPE* bins, int* locks,
+    OUTPUTTYPE* rvals, int* rkeys,
+    int* doReduce, bool checkReduce,
+    int* warpmutex)
+{
+    int myKeys[nMultires];
+    OUTPUTTYPE vals[nMultires];
+    bool doWrite = true;
+    if (laststeps){
+        if (startidx < end)
+        {
+            xformObj(input, startidx, &myKeys[0], &vals[0], nMultires);
+        }
+        else
+        {
+            doWrite = false;
+            #pragma unroll
+            for (int r = 0; r < nMultires; r++){
+                vals[r] = zero;
+                myKeys[r] = -1;
+            }
+        }
+    }
+    else
+    {
+        xformObj(input, startidx, &myKeys[0], &vals[0], nMultires);
+    }
+     // See keyIndex-reasoning above
+    int binSet = (threadIdx.x & ((1 << nBinSetslog2) - 1));
+#if __CUDA_ARCH__ >= 200
+/*    if (laststeps){
+        *doReduce = false;
+    }
+    else*/
+    {
+         if (checkReduce){
+            *doReduce = checkForReduction<nMultires>(myKeys, rkeys);
+            if (histotype == histogram_generic || histotype == histogram_atomic_add){
+                __shared__ int tmp;
+                tmp = 0;
+                __syncthreads();
+                if (*doReduce && ((threadIdx.x & 31) == 0)) atomicAdd(&tmp, 1);
+                __syncthreads();
+                if (tmp > HBLOCK_SIZE / 2)
+                    *doReduce = true;
+                else
+                    *doReduce = false;
+            }
+            //if (laststeps) *doReduce = false;
+/*            __syncthreads();
+            bool tmpred = checkForReduction<nMultires>(myKeys, rkeys);
+            if ((threadIdx.x & 31) == 0) atomicExch(doReduce, (int)tmpred);
+            __syncthreads();*/
+         }
+    }
+#endif
 
-    return 2 * n * nOut * sizeof(OUTPUTTYPE);
+     // TODO: Unroll this later - nvcc (at least older versions) can't unroll atomics (?)
+    // TODO: How to avoid bank-conflicts? Any way to avoid?
 
+
+#if __CUDA_ARCH__ >= 200
+#define ONE_HS_STEP(RESID) do { if ((RESID) < nMultires) { \
+             int keyIndex = doWrite == false ? 0 : (myKeys[(RESID % nMultires)] << nBinSetslog2) + binSet; \
+             if (*doReduce){\
+                if (histotype == histogram_generic || histotype == histogram_atomic_add){\
+                    bool Iwrite;\
+                    TAKE_WARP_MUTEX(0);\
+                    Iwrite = reduceToUnique<histotype, false>(&vals[(RESID % nMultires)], myKeys[(RESID % nMultires)], NULL, sumfunObj, rkeys, rvals);\
+                    if (Iwrite && doWrite) bins[keyIndex] = sumfunObj(bins[keyIndex], vals[(RESID % nMultires)]);\
+                    /*if (histotype == histogram_generic) myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite && doWrite, warpmutex);\
+                    else wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite && doWrite, warpmutex);*/\
+                    GIVE_WARP_MUTEX(0);\
+                } else { \
+                    bool Iwrite = reduceToUnique<histotype, false>(&vals[(RESID % nMultires)], myKeys[(RESID % nMultires)], NULL, sumfunObj, rkeys, rvals);\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite && doWrite, warpmutex); \
+                }\
+             } else {\
+                if (histotype == histogram_generic)\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else if (histotype == histogram_atomic_add)\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else  if (histotype == histogram_atomic_inc)\
+                    wrapAtomicIncWarp<laststeps>(&bins[keyIndex], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else{\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                 }\
+             } } } while (0)
+#else
+#define ONE_HS_STEP(RESID) do { if ((RESID) < nMultires) { \
+                int keyIndex = doWrite == false ? 0 : (myKeys[(RESID % nMultires)] << nBinSetslog2) + binSet; \
+                if (histotype == histogram_generic)\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else if (histotype == histogram_atomic_add)\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else  if (histotype == histogram_atomic_inc)\
+                    wrapAtomicIncWarp<laststeps>(&bins[keyIndex], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                else{\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, doWrite, warpmutex);\
+                 }\
+                } } while (0)
+#endif
+
+     ONE_HS_STEP(0);
+     ONE_HS_STEP(1);
+     ONE_HS_STEP(2);
+     ONE_HS_STEP(3);
+     //#pragma unroll
+     for (int resid = 4; resid < nMultires; resid++){
+         ONE_HS_STEP(resid);
+     }
 }
 
-// NOTE: Output to HOST MEMORY!!! - TODO; Provide API for device memory output? Why?
+
+template <int nBinSetslog2, histogram_type histotype, int nMultires, bool lastSteps, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+__global__
+void histogramKernel_sharedbins_new(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT start, INDEXT end,
+    OUTPUTTYPE zero,
+    OUTPUTTYPE* blockOut, int nOut,
+    int outStride,
+    int nSteps)
+{
+  extern __shared__ int cudahistogram_binstmp[];
+  OUTPUTTYPE* bins = (OUTPUTTYPE*)&(*cudahistogram_binstmp);
+
+  int* locks = (int*)&bins[(nOut << nBinSetslog2)];
+  int* rkeys = NULL;
+  OUTPUTTYPE* rvals = NULL;
+  //__shared__
+  int warpmutex;
+  //INIT_WARP_MUTEX2(warpmutex);
+
+#if __CUDA_ARCH__ >= 200
+  int warpId = threadIdx.x >> 5;
+  if (histotype == histogram_generic)
+      rkeys = &locks[(nOut << nBinSetslog2)];
+  else
+      rkeys = locks;
+  rvals = (OUTPUTTYPE*)&rkeys[32];
+  if (histotype == histogram_atomic_inc){
+      rkeys = &rkeys[warpId << 5];
+      //rvals = &rvals[warpId << 5];
+  }
+#endif
+  const int nBinSets = 1 << nBinSetslog2;
+  // Reset all bins to zero...
+  for (int j = 0; j < ((nOut << nBinSetslog2) >> HBLOCK_SIZE_LOG2) + 1; j++)
+  {
+    int bin = (j << HBLOCK_SIZE_LOG2) + threadIdx.x;
+    if (bin < (nOut << nBinSetslog2)){
+        bins[bin] = zero;
+    }
+  }
+#if HBLOCK_SIZE > 32
+  __syncthreads();
+#endif
+  int outidx = blockIdx.x;
+  INDEXT startidx = (INDEXT)((outidx * nSteps) * HBLOCK_SIZE + start + threadIdx.x);
+
+  /*__shared__*/ int doReduce; // local var - TODO: Is this safe??
+  doReduce = 0;
+
+#define MED_UNROLL_LOG2     2
+#define MED_UNROLL          (1 << MED_UNROLL_LOG2)
+  int step;
+  for (step = 0; step < (nSteps >> MED_UNROLL_LOG2); step++)
+  {
+      //#pragma unroll
+      //for (int substep = 0; substep < MED_UNROLL; substep++){
+          histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+            (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, true, &warpmutex);
+          startidx += HBLOCK_SIZE;
+          histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+            (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex);
+          startidx += HBLOCK_SIZE;
+          histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+            (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex);
+          startidx += HBLOCK_SIZE;
+          histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+            (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex);
+          startidx += HBLOCK_SIZE;
+      //}
+  }
+  step = (nSteps >> MED_UNROLL_LOG2) << MED_UNROLL_LOG2;
+  for (; step < nSteps ; step++)
+  {
+      histogramKernel_stepImpl<histotype, nBinSetslog2, nMultires, lastSteps, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, (step & 7) == 0, &warpmutex);
+      startidx += HBLOCK_SIZE;
+  }
+
+#if HBLOCK_SIZE > 32
+  __syncthreads();
+#endif
+  // Finally put together the bins
+  for (int j = 0; j < (nOut >> HBLOCK_SIZE_LOG2) + 1; j++) {
+    int key = (j << HBLOCK_SIZE_LOG2) + threadIdx.x;
+    if (key < nOut)
+    {
+      OUTPUTTYPE res = blockOut[key * outStride + outidx];
+      //int tmpBin = bin;
+#pragma unroll
+      for (int k = 0; k < nBinSets; k++)
+      {
+          //tmpBin += nOut;
+          res = sumfunObj(res, bins[(key << nBinSetslog2) + k]);
+      }
+        //printf("tid:%02d, write out bin: %02d, \n", threadIdx.x, bin);
+      blockOut[key * outStride + outidx] = res;
+    }
+  }
+}
+
+
+template <histogram_type histotype, typename OUTPUTTYPE>
+static int getMediumHistoTmpbufSize(int nOut, cudaDeviceProp* props)
+{
+    int nblocks = props->multiProcessorCount * 8;
+    // NOTE: The other half is used by multireduce...
+    return 2 * nblocks * nOut * sizeof(OUTPUTTYPE);
+}
+
+
+
 template <histogram_type histotype, int nMultires,
     typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
     typename OUTPUTTYPE, typename INDEXT>
@@ -2088,12 +2206,13 @@ void callHistogramKernelImpl(
     TRANSFORMFUNTYPE xformObj,
     SUMFUNTYPE sumfunObj,
     INDEXT start, INDEXT end,
-    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut, int nsteps,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     cudaDeviceProp* props,
     cudaStream_t stream,
     size_t* getTmpBufSize,
     void* tmpBuffer,
-    bool outInDev)
+    bool outInDev,
+    int cuda_arch)
 {
   INDEXT size = end - start;
   // Check if there is something to do actually...
@@ -2102,17 +2221,9 @@ void callHistogramKernelImpl(
       if (getTmpBufSize) *getTmpBufSize = 0;
       return;
   }
-  const dim3 block = HBLOCK_SIZE;
+  int nblocks = props->multiProcessorCount * 8;
 
-  dim3 grid = size / ( nsteps * HBLOCK_SIZE );
-  if (grid.x * nsteps * HBLOCK_SIZE < size)
-    grid.x++;
 
-  int n = grid.x;
-
-  // Adjust nsteps - new algorithm expects it to be correct!
-  nsteps = size / (n * HBLOCK_SIZE);
-  if (nsteps * n * HBLOCK_SIZE < size) nsteps++;
 
   // Assert that our grid is not too large!
   //MY_ASSERT(n < 65536 && "Sorry - currently we can't do such a big problems with histogram-kernel...");
@@ -2122,19 +2233,25 @@ void callHistogramKernelImpl(
   if (getTmpBufSize)
   {
       // NOTE: The other half is used by multireduce...
-      *getTmpBufSize = 2 * n * nOut * sizeof(OUTPUTTYPE);
+      *getTmpBufSize = 2 * nblocks * nOut * sizeof(OUTPUTTYPE);
       return;
   }
+
+  int nsteps = size / ( nblocks * HBLOCK_SIZE );
+  if (nsteps *  nblocks * HBLOCK_SIZE  < size) nsteps++;
+  if (nsteps > MAX_NHSTEPS)
+      nsteps = MAX_NHSTEPS;
+
 
   if (tmpBuffer)
   {
     char* tmpptr = (char*)tmpBuffer;
     tmpOut = (OUTPUTTYPE*)tmpBuffer;
-    tmpBuffer = (void*)&tmpptr[n * nOut * sizeof(OUTPUTTYPE)];
+    tmpBuffer = (void*)&tmpptr[nblocks * nOut * sizeof(OUTPUTTYPE)];
   }
   else
   {
-    cudaMalloc((void**)&tmpOut, n * nOut * sizeof(OUTPUTTYPE));
+    cudaMalloc((void**)&tmpOut, nblocks * nOut * sizeof(OUTPUTTYPE));
   }
 
   /* For block size other that power of two:
@@ -2148,7 +2265,7 @@ void callHistogramKernelImpl(
 #define IBLOCK_SIZE_LOG2    7
 #define IBLOCK_SIZE         (1 << IBLOCK_SIZE_LOG2)
     int initPaddedSize =
-      ((n * nOut) + (IBLOCK_SIZE) - 1) & (~((IBLOCK_SIZE) - 1));
+      ((nblocks * nOut) + (IBLOCK_SIZE) - 1) & (~((IBLOCK_SIZE) - 1));
     const dim3 initblock = IBLOCK_SIZE;
     dim3 initgrid = initPaddedSize >> ( IBLOCK_SIZE_LOG2 );
     int nsteps = 1;
@@ -2156,48 +2273,93 @@ void callHistogramKernelImpl(
     {
         initgrid.x >>= 1;
         nsteps <<= 1;
-        if (nsteps * initgrid.x * IBLOCK_SIZE < n * nOut)
+        if (nsteps * initgrid.x * IBLOCK_SIZE < nblocks * nOut)
             initgrid.x++;
     }
-    initKernel<<<initgrid,initblock,0,stream>>>(tmpOut, zero, n * nOut, nsteps);
+    initKernel<<<initgrid,initblock,0,stream>>>(tmpOut, zero, nblocks * nOut, nsteps);
 #undef IBLOCK_SIZE_LOG2
 #undef IBLOCK_SIZE
   }
   int nKeysetslog2 = determineNKeySetsLog2(sizeof(OUTPUTTYPE), nOut, props);
   if (nKeysetslog2 < 0) nKeysetslog2 = 0;
-  int extSharedNeeded = ((nOut << nKeysetslog2)) * (sizeof(OUTPUTTYPE) + sizeof(int)) + (sizeof(OUTPUTTYPE) * HBLOCK_SIZE);
-  if (nOut < HBLOCK_SIZE) extSharedNeeded += sizeof(int) * (HBLOCK_SIZE - nOut);
-  //printf("binsets = %d, steps = %d\n", (1 << nKeysetslog2), nsteps);
-  switch (nKeysetslog2)
+  int extSharedNeeded = ((nOut << nKeysetslog2)) * (sizeof(OUTPUTTYPE)); // bins
+  if (histotype == histogram_generic || cuda_arch < 130)
+      extSharedNeeded += ((nOut << nKeysetslog2)) * (sizeof(int)); // locks
+
+  if (cuda_arch >= 200)
   {
-    case 0:
-      histogramKernel_sharedbins_new<0, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;
-/*    case 1:
-      histogramKernel_sharedbins_new<1, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;
-    case 2:
-      histogramKernel_sharedbins_new<2, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;
-    case 3:
-      histogramKernel_sharedbins_new<3, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;
-    case 4:
-      histogramKernel_sharedbins_new<4, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;
-    case 5:
-      histogramKernel_sharedbins_new<5, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
-          input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
-      break;*/
-    case -1:
-        // TODO: Error?
-      //assert(0); // "Sorry - not implemented yet"
-        break;
+      // Reduction stuff:
+      if (histotype == histogram_generic || histotype == histogram_atomic_add)
+      {
+          extSharedNeeded += ((sizeof(OUTPUTTYPE) + sizeof(int)) << 5); // reduction values
+      }
+      else
+      {
+          extSharedNeeded += (sizeof(int) << HBLOCK_SIZE_LOG2); // keys per warp of one thread
+      }
+
+  }
+  /*int extSharedNeeded = ((nOut << nKeysetslog2)) * (sizeof(OUTPUTTYPE) + sizeof(int)) + (sizeof(OUTPUTTYPE) * HBLOCK_SIZE);
+  if (nOut < HBLOCK_SIZE) extSharedNeeded += sizeof(int) * (HBLOCK_SIZE - nOut);
+  if (cuda_arch < 130)
+      extSharedNeeded += ((nOut << nKeysetslog2)) * (sizeof(int));*/
+  //printf("binsets = %d, steps = %d\n", (1 << nKeysetslog2), nsteps);
+  int nOrigBlocks = nblocks;
+  INDEXT myStart = start;
+  while(myStart < end)
+  {
+      bool lastStep = false;
+      if (myStart + nsteps * nblocks * HBLOCK_SIZE > end)
+      {
+          size = end - myStart;
+          nsteps = (size) / (nblocks * HBLOCK_SIZE);
+          if (nsteps < 1)
+          {
+              lastStep = true;
+              nsteps = 1;
+              nblocks = size / HBLOCK_SIZE;
+              if (nblocks * HBLOCK_SIZE < size)
+                  nblocks++;
+          }
+      }
+      dim3 grid = nblocks;
+      dim3 block = HBLOCK_SIZE;
+      switch (nKeysetslog2)
+      {
+        case 0:
+          if (lastStep)
+            histogramKernel_sharedbins_new<0, histotype, nMultires, true><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, myStart, end, zero, tmpOut, nOut, nOrigBlocks, nsteps);
+          else
+              histogramKernel_sharedbins_new<0, histotype, nMultires, false><<<grid, block, extSharedNeeded, stream>>>(
+                input, xformObj, sumfunObj, myStart, end, zero, tmpOut, nOut, nOrigBlocks, nsteps);
+          break;
+    /*    case 1:
+          histogramKernel_sharedbins_new<1, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
+          break;
+        case 2:
+          histogramKernel_sharedbins_new<2, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
+          break;
+        case 3:
+          histogramKernel_sharedbins_new<3, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
+          break;
+        case 4:
+          histogramKernel_sharedbins_new<4, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
+          break;
+        case 5:
+          histogramKernel_sharedbins_new<5, histotype, nMultires><<<grid, block, extSharedNeeded, stream>>>(
+              input, xformObj, sumfunObj, start, end, zero, tmpOut, nOut, n, nsteps);
+          break;*/
+        case -1:
+            // TODO: Error?
+          //assert(0); // "Sorry - not implemented yet"
+            break;
+      }
+      myStart += nsteps * nblocks * HBLOCK_SIZE;
   }
 
 #if H_ERROR_CHECKS
@@ -2207,7 +2369,7 @@ void callHistogramKernelImpl(
 #endif
   // OK - so now tmpOut contains our gold - we just need to dig it out now
 
-  callMultiReduce(n, nOut, out, tmpOut, sumfunObj, zero, stream, tmpBuffer, outInDev);
+  callMultiReduce(nOrigBlocks, nOut, out, tmpOut, sumfunObj, zero, stream, tmpBuffer, outInDev);
   // Below same as host-code
   #if 0
   {
@@ -2262,8 +2424,12 @@ bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props, int cuda_a
   // On the other hand this requires atomic operations on the shared memory, which could be somewhat slower on
   // arbitrary types, but all in all, this would seem to provide a better route. At least worth investigating...
   int shlimit = props->sharedMemPerBlock - 300;
-  int limit = cuda_arch < 200 ? shlimit : shlimit / 2;
-  if ((nOut + HBLOCK_SIZE) * sizeof(zero) + nOut * sizeof(int) < limit)
+  int limit = shlimit;
+  // TODO: Pessimistic limit
+  int need = (sizeof(zero) + sizeof(int)) * nOut;
+  if (cuda_arch >= 200)
+    need += HBLOCK_SIZE * sizeof(int) + 32 * sizeof(zero);
+  if (need <= limit)
     return true;
   return false;
 }
@@ -2965,35 +3131,13 @@ callHistogramKernel(
     }
     else
     {
-        int nsteps = nOut * NHSTEPSPERKEY;
-        if (nsteps > MAX_NHSTEPS) nsteps = MAX_NHSTEPS;
-        // TODO: Silly magic number
-        int max = HBLOCK_SIZE * 1024 * nsteps;
-        bool done = false;
-        for (INDEXT i0 = start; !done; i0 += max)
-        {
-            INDEXT i1 = i0 + max;
-            if (i1 >= end || i1 < start)
-            {
-                i1 = end;
-                done = true;
-                INDEXT size = i1 - i0;
-                int nblocks = size / (HBLOCK_SIZE * nsteps);
-                if (HBLOCK_SIZE * nblocks * nsteps < size) nblocks++;
-                if (nblocks < props.multiProcessorCount * 8 && nsteps > 1)
-                {
-                    nsteps = size / (HBLOCK_SIZE * props.multiProcessorCount * 8);
-                    if (((HBLOCK_SIZE * nsteps * props.multiProcessorCount * 8)) < size) nsteps++;
-                }
-            }
-        callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, i0, i1, zero, out, nOut, nsteps, &props, stream, NULL, tmpBuffer, outInDev);
-        }
+        callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, NULL, tmpBuffer, outInDev, cuda_arch);
     }
     cudaThreadSetCacheConfig(old);
     return cudaSuccess;
 }
 
-template <typename nDimIndexFun, int nDim, typename USERINPUTTYPE, typename INDEXT>
+template <typename nDimIndexFun, int nDim, typename USERINPUTTYPE, typename INDEXT, typename OUTPUTTYPE>
 class wrapHistoInput
 {
 public:
@@ -3002,7 +3146,7 @@ public:
     //int ends[nDim];
     INDEXT sizes[nDim];
     __host__ __device__
-    void operator() (USERINPUTTYPE input, INDEXT i, int* result_index, int* results, int nresults) const {
+    void operator() (USERINPUTTYPE input, INDEXT i, int* result_index, OUTPUTTYPE* results, int nresults) const {
         int coords[nDim];
         int tmpi = i;
   #pragma unroll
@@ -3038,7 +3182,7 @@ callHistogramKernelNDim(
     bool outInDev,
     cudaStream_t stream, void* tmpBuffer)
 {
-    wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE,INDEXT> wrapInput;
+    wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE, INDEXT, OUTPUTTYPE> wrapInput;
     INDEXT start = 0;
     INDEXT size = 1;
     for (int d = 0; d < nDim; d++)
@@ -3155,17 +3299,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
     }
     else
     {
-        int nsteps = nOut * NHSTEPSPERKEY;
-        if (nsteps > MAX_NHSTEPS) nsteps = MAX_NHSTEPS;
-        int size = HBLOCK_SIZE * 1024 * nsteps;
-        int nblocks = size / (HBLOCK_SIZE * nsteps);
-        if (HBLOCK_SIZE * nblocks * nsteps < size) nblocks++;
-        if (nblocks < props.multiProcessorCount * 8 && nsteps > 1)
-        {
-            nsteps = size / (HBLOCK_SIZE * props.multiProcessorCount * 8);
-            if (((HBLOCK_SIZE * nsteps * props.multiProcessorCount * 8)) < size) nsteps++;
-        }
-        result = getMediumHistoTmpbufSize<histotype, OUTPUTTYPE>(nOut, &props, size, nsteps);
+        result = getMediumHistoTmpbufSize<histotype, OUTPUTTYPE>(nOut, &props);
     }
     return result;
 }
@@ -3197,7 +3331,10 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 #undef MAX_SMALL_STEPS
 #undef USE_ATOMICS_HASH
 #undef USE_BALLOT_HISTOGRAM
-#undef USE_ATOMIC_ADD
+#undef TAKE_WARP_MUTEX
+#undef GIVE_WARP_MUTEX
+#undef FREE_MUTEX_ID
+
 
 #if USE_MEDIUM_PATH
 #undef MEDIUM_BLOCK_SIZE_LOG2

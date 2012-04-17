@@ -44,7 +44,8 @@ const int checkNBins[] =
     320, 384, 448, 512,
     640, 768, 896, 1024,
     1280, 1536, 1792, 2048,
-    2560, 3072, 3584, 4096
+    2560, 3072, 3584, 4096,
+    6144, 8192, 10240, 16384
 };
 
 #define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
@@ -198,6 +199,10 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
   test_xform4 transformFunInt;
   test_sumfun2 sumFun;
 
+  int* gpures;
+  cudaMalloc(&gpures, sizeof(int) * nIndices);
+  cudaMemset(gpures, 0, sizeof(int) * nIndices);
+
   for (srun = 0; srun < nruns; srun++)
   {
     if (print)
@@ -246,14 +251,14 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
         test_xformsmall xformIntSmall;
         unsigned int * newInput = (unsigned int *)INPUT;
         if (nIndices <= 256)
-            callHistogramKernel<histogram_atomic_inc, 4>(newInput, xformByteSmall, sumFun, 4*index_0, 4*index_1, zero, tmpres, nIndices, false, 0, tmpBuffer);
+            callHistogramKernel<histogram_atomic_inc, 4>(newInput, xformByteSmall, sumFun, 4*index_0, 4*index_1, zero, gpures, nIndices, true, 0, tmpBuffer);
         else
-            callHistogramKernel<histogram_atomic_inc, 1>(newInput, xformIntSmall,  sumFun, 4*index_0, 4*index_1, zero, tmpres, nIndices, false, 0, tmpBuffer);
+            callHistogramKernel<histogram_atomic_inc, 1>(newInput, xformIntSmall,  sumFun, 4*index_0, 4*index_1, zero, gpures, nIndices, true, 0, tmpBuffer);
 #else
         if (nIndices <= 256)
-            callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFunByte, sumFun, index_0, index_1, zero, tmpres, nIndices, false, 0, tmpBuffer);
+            callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFunByte, sumFun, index_0, index_1, zero, gpures, nIndices, true, 0, tmpBuffer);
         else
-            callHistogramKernel<histogram_atomic_inc, 4>(INPUT, transformFunInt, sumFun, index_0, index_1, zero, tmpres, nIndices, false, 0, tmpBuffer);
+            callHistogramKernel<histogram_atomic_inc, 4>(INPUT, transformFunInt, sumFun, index_0, index_1, zero, gpures, nIndices, true, 0, tmpBuffer);
 #endif
     }
     if (print && (!cpurun))
@@ -262,6 +267,7 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
     }
     print = false;
   }
+  cudaMemcpy(tmpres, gpures, sizeof(int) * nIndices, cudaMemcpyDeviceToHost);
   free(tmpres);
 }
 

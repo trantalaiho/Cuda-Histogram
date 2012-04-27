@@ -887,12 +887,13 @@ bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj
       bool writeResult = myKey >= 0;
       int myIdx = threadIdx.x + 1;
       outputs[threadIdx.x] = *res;
+      if (blockDim.x > 32) __syncthreads();
       // The assumption for sanity of this loop here is that all the data is in registers or shared memory and
       // hence this loop will not actually be __that__ slow.. Also it helps if the data is spread out (ie. there are
       // a lot of different indices here)
-      for (i = 1; i < HBLOCK_SIZE && writeResult; i++)
+      for (i = 1; i < blockDim.x && writeResult; i++)
       {
-        if (myIdx >= HBLOCK_SIZE)
+        if (myIdx >= blockDim.x)
           myIdx = 0;
         // Is my index the same as the index on the index-list?
         if (keys[myIdx] == myKey /*&& threadIdx.x != myIdx*/)
@@ -912,6 +913,15 @@ bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj
           // Manual reduce
           int tid = threadIdx.x;
           keys[tid] = *nSame;
+          if (blockDim.x > 32){
+            __syncthreads();
+            for (int limit = (blockDim.x >> 1); limit >= 32; limit >>= 1){
+              if (tid < limit) keys[tid] = keys[tid] > keys[tid + limit] ? keys[tid] : keys[tid+limit];
+              __syncthreads();
+            }
+
+
+          }
           if (tid < 16) keys[tid] = keys[tid] > keys[tid + 16] ? keys[tid] : keys[tid+16];
           if (tid < 8) keys[tid] = keys[tid] > keys[tid + 8] ? keys[tid] : keys[tid+8];
           if (tid < 4) keys[tid] = keys[tid] > keys[tid + 4] ? keys[tid] : keys[tid+4];

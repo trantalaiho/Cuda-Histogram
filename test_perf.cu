@@ -45,7 +45,8 @@ const int checkNBins[] =
     640, 768, 896, 1024,
     1280, 1536, 1792, 2048,
     2560, 3072, 3584, 4096,
-    6144, 8192, 10240, 16384
+    6144, 8192, 10240, 16384,
+    32768, 65536, 131072
 };
 
 #define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)

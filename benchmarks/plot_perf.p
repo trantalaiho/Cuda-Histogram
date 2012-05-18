@@ -22,7 +22,7 @@ if (term == 3) set output 'perf_rnd.html'
 set autoscale       # Scale plot automatically
 unset log
 set logscale x 2
-set xrange [32:17000]
+set xrange [32:132000]
 unset label
 set xtic auto
 set ytic auto
@@ -47,7 +47,7 @@ if (term == 3) set output 'perf_degen.html'
 set autoscale       # Scale plot automatically
 unset log
 set logscale x 2
-set xrange [32:17000]
+set xrange [32:132000]
 unset label
 set xtic auto
 set ytic auto
@@ -73,7 +73,7 @@ if (term == 3) set output 'perf_load.html'
 set autoscale       # Scale plot automatically
 unset log
 set logscale x 2
-set xrange [32:17000]
+set xrange [32:132000]
 unset label
 set xtic auto
 set ytic auto

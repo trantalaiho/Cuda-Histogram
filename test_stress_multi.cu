@@ -24,15 +24,15 @@
  *
  */
 
-#define TESTMAXIDX   3855      // 16 keys / indices
+#define TESTMAXIDX   6855      // 16 keys / indices
 #define TEST_IS_POW2 0
 #define TEST_SIZE (1)   // 1000 million inputs
-#define NRUNS 434          // Repeat 100 times => 100 gigainputs
+#define NRUNS 334          // Repeat 100 times => 100 gigainputs
 #define START_INDEX	2
 #define NSTRESS_RUNS    NRUNS
 #define START_NBINS	1
 #define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-#define NBIN_INC	47
+#define NBIN_INC	79
 #include <assert.h>
 #include <stdio.h>
 #include "cuda_histogram.h"
@@ -215,7 +215,7 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
     int size  = index_1 - index_0;
     //index_0 += size;
     index_1 += 1;
-    if (srun % 37 == 19)
+    if (srun % 23 == 19)
         index_1 +=  (4 * size / 3) + (size % 73);
     if (index_0 < 0 || index_1 < 0) {
       index_0 = 0;

@@ -209,6 +209,10 @@ callHistogramKernel2Dim(
 #define HBLOCK_SIZE_LOG2    7
 #define HBLOCK_SIZE         (1 << HBLOCK_SIZE_LOG2) // = 32
 
+#define HMBLOCK_SIZE_LOG2   8
+#define HMBLOCK_SIZE         (1 << HMBLOCK_SIZE_LOG2) // = 32
+
+
 #define LBLOCK_SIZE_LOG2    5
 #define LBLOCK_SIZE         (1 << LBLOCK_SIZE_LOG2) // = 256
 #define LBLOCK_WARPS        (LBLOCK_SIZE >> 5)
@@ -217,15 +221,17 @@ callHistogramKernel2Dim(
 
 #if USE_MEDIUM_PATH
 // For now only MEDIUM_BLOCK_SIZE_LOG2 == LBLOCK_SIZE_LOG2 works
-#   define MEDIUM_BLOCK_SIZE_LOG2   LBLOCK_SIZE_LOG2
+#   define MEDIUM_BLOCK_SIZE_LOG2   8
 #   define MEDIUM_BLOCK_SIZE        (1 << MEDIUM_BLOCK_SIZE_LOG2) // 128
 #   define MBLOCK_WARPS             (MEDIUM_BLOCK_SIZE >> 5)
+#define MED_THREAD_DEGEN    16
 #endif
 
 #define RBLOCK_SIZE         64
 #define RMAXSTEPS           80
 #define NHSTEPSPERKEY       32
 #define MAX_NHSTEPS         1024
+#define MAX_MULTISTEPS      1024
 #define MAX_NLHSTEPS        2048
 
 #define GATHER_BLOCK_SIZE_LOG2  6
@@ -377,6 +383,12 @@ void callMultiReduce(
   else
   {
     cudaMalloc((void**)&resultTemp, sizeof(OUTPUTTYPE) * nOut * arrLen);
+#if H_ERROR_CHECKS
+    //printf("resultTemp = %p\n", resultTemp);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror0 = %s\n", cudaGetErrorString( error ));
+#endif
   }
   OUTPUTTYPE* output = resultTemp;
   enum cudaMemcpyKind fromOut = outInDev ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
@@ -397,13 +409,24 @@ void callMultiReduce(
 
     if (xblocks == 1) // LAST ONE to start
     {
+      //printf("cudaMemcpy(%p, %p, %d, %d);\n", output, h_results, sizeof(OUTPUTTYPE) * nOut, fromOut);
       if (stream != 0)
         cudaMemcpyAsync(output, h_results, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
       else
         cudaMemcpy(output, h_results, sizeof(OUTPUTTYPE) * nOut, fromOut);
     }
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror1 = %s\n", cudaGetErrorString( error ));
+#endif
     // Then the actual kernel call
     multireduceKernel<<<grid, block, 0, stream>>>(input, n, nOut, steps, sumFunObj, zero, arrLen, output);
+#if H_ERROR_CHECKS
+    error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror2 = %s\n", cudaGetErrorString( error ));
+#endif
     if (xblocks > 1)
     {
         // Swap pointers:
@@ -421,10 +444,20 @@ void callMultiReduce(
     cudaMemcpyAsync(h_results, output, sizeof(OUTPUTTYPE) * nOut, toOut, stream);
   else
     cudaMemcpy(h_results, output, sizeof(OUTPUTTYPE) * nOut, toOut);
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror3 = %s\n", cudaGetErrorString( error ));
+#endif
   if (!tmpbuf)
   {
     cudaFree(resultTemp);
   }
+#if H_ERROR_CHECKS
+    error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror4 = %s\n", cudaGetErrorString( error ));
+#endif
 }
 
 
@@ -515,7 +548,7 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
 
 #define FREE_MUTEX_ID   0xffeecafe
 #define TAKE_WARP_MUTEX(ID) do { \
-                                int warpIdWAM = threadIdx.x / 32; \
+                                int warpIdWAM = threadIdx.x >> 5; \
                                 __shared__ volatile int lockVarWarpAtomicMutex;\
                                 bool doneWAM = false;\
                                 bool allDone = false; \
@@ -524,6 +557,7 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
                                         if (!doneWAM) lockVarWarpAtomicMutex = warpIdWAM; \
                                         __syncthreads(); \
                                         if (lockVarWarpAtomicMutex == FREE_MUTEX_ID) allDone = true; \
+                                        __syncthreads(); \
                                         if (lockVarWarpAtomicMutex == warpIdWAM){ /* We Won */
 
                                             // User code comes here
@@ -532,6 +566,7 @@ void gatherKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int nOut, int nEnt
                                             lockVarWarpAtomicMutex = FREE_MUTEX_ID; \
                                         } \
                                     } \
+                                    __syncthreads(); \
                             } while(0)
 
 // NOTE: Init must be called from divergent-free code (or with exited warps)
@@ -869,9 +904,6 @@ void myAtomicAddStats(OUTPUTTYPE* addr, OUTPUTTYPE val, volatile int* keyAddr, S
         *nSameOut = nSame[0];
     }
 }
-
-
-
 // TODO: Make unique within one warp?
 template<histogram_type histotype, bool checkNSame, typename SUMFUNTYPE, typename OUTPUTTYPE>
 static inline __device__
@@ -885,15 +917,14 @@ bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj
 
       int i;
       bool writeResult = myKey >= 0;
-      int myIdx = threadIdx.x + 1;
-      outputs[threadIdx.x] = *res;
-      if (blockDim.x > 32) __syncthreads();
+      int myIdx = (threadIdx.x & 31) + 1;
+      outputs[(threadIdx.x & 31)] = *res;
       // The assumption for sanity of this loop here is that all the data is in registers or shared memory and
       // hence this loop will not actually be __that__ slow.. Also it helps if the data is spread out (ie. there are
       // a lot of different indices here)
-      for (i = 1; i < blockDim.x && writeResult; i++)
+      for (i = 1; i < 32 && writeResult; i++)
       {
-        if (myIdx >= blockDim.x)
+        if (myIdx >= 32)
           myIdx = 0;
         // Is my index the same as the index on the index-list?
         if (keys[myIdx] == myKey /*&& threadIdx.x != myIdx*/)
@@ -913,15 +944,6 @@ bool reduceToUnique(OUTPUTTYPE* res, int myKey, int* nSame, SUMFUNTYPE sumfunObj
           // Manual reduce
           int tid = threadIdx.x;
           keys[tid] = *nSame;
-          if (blockDim.x > 32){
-            __syncthreads();
-            for (int limit = (blockDim.x >> 1); limit >= 32; limit >>= 1){
-              if (tid < limit) keys[tid] = keys[tid] > keys[tid + limit] ? keys[tid] : keys[tid+limit];
-              __syncthreads();
-            }
-
-
-          }
           if (tid < 16) keys[tid] = keys[tid] > keys[tid + 16] ? keys[tid] : keys[tid+16];
           if (tid < 8) keys[tid] = keys[tid] > keys[tid + 8] ? keys[tid] : keys[tid+8];
           if (tid < 4) keys[tid] = keys[tid] > keys[tid + 4] ? keys[tid] : keys[tid+4];
@@ -1536,6 +1558,8 @@ void histo_kernel_largeNBins(
 
 #if USE_MEDIUM_PATH
 
+//
+
 template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
 __global__
 void histo_kernel_mediumNBins(
@@ -1548,7 +1572,7 @@ void histo_kernel_mediumNBins(
     int nSteps)
 {
 #if __CUDA_ARCH__ >= 120
-    OUTPUTTYPE* ourOut = &blockOut[nOut * blockIdx.x];
+    OUTPUTTYPE* ourOut = &blockOut[nOut * (threadIdx.x % MED_THREAD_DEGEN) * blockIdx.x];
     INDEXT myStart = start + (INDEXT)(((blockIdx.x * nSteps) << MEDIUM_BLOCK_SIZE_LOG2) + threadIdx.x);
     bool reduce = false;
     int nSameTot = 0;
@@ -1565,9 +1589,9 @@ void histo_kernel_mediumNBins(
             int nSame;
             __shared__ int keys[MEDIUM_BLOCK_SIZE];
             __shared__ OUTPUTTYPE rOut[MEDIUM_BLOCK_SIZE];
-            //int warpIdx = threadIdx.x >> 5;
-            int* wkeys = &keys[0/*warpIdx << 5*/];
-            OUTPUTTYPE* wOut = &rOut[0/*warpIdx << 5*/];
+            int warpIdx = threadIdx.x >> 5;
+            int* wkeys = &keys[warpIdx << 5];
+            OUTPUTTYPE* wOut = &rOut[warpIdx << 5];
             bool Iwrite;
 #define ADD_ONE_RESULT(RESID)                                                                   \
             do { if (RESID < nMultires) {                                                       \
@@ -1579,8 +1603,7 @@ void histo_kernel_mediumNBins(
                         (&myOut[RESID % nMultires], myKey[RESID % nMultires], NULL, sumfunObj,  \
                             wkeys, wOut);                                                       \
                     if (Iwrite)                                                                 \
-                        ourOut[myKey[RESID % nMultires]] = sumfunObj(                           \
-                                ourOut[myKey[RESID % nMultires]], myOut[RESID % nMultires]);    \
+                        atomicAdd(&ourOut[myKey[RESID % nMultires]], myOut[RESID % nMultires]); \
                     if (check){                                                                 \
                         nSameTot += nSame;                                                      \
                         checkStrategyFun(&reduce, nSame, nSameTot, step, 0);                    \
@@ -1659,9 +1682,9 @@ static int determineHashSizeLog2(size_t outSize, int* nblocks, cudaDeviceProp* p
     if (hashSize >= 1<< 2) { hashSize >>=  2; res +=  2; }
     if (hashSize >= 1<< 1) {                  res +=  1; }
 
-    // Now res holds the log2 of hash size => n active blocks = sharedTot / (outSize << res);
+    // Now res holds the log2 of hash size => n active blocksMEDIUM_BLOCK_SIZE_LOG2 = sharedTot / (outSize << res);
     *nblocks = (sharedTot / (outSize << res)) * props->multiProcessorCount;
-    if (*nblocks > props->multiProcessorCount * 16) *nblocks = props->multiProcessorCount * 16;
+    if (*nblocks > props->multiProcessorCount * 8) *nblocks = props->multiProcessorCount * 8;
     return res;
 }
 
@@ -1680,13 +1703,16 @@ void initKernel(OUTPUTTYPE* tmpOut, OUTPUTTYPE zeroVal, int tmpOutSize, int step
 }
 
 template <histogram_type histotype, typename OUTPUTTYPE>
-static int getLargeBinTmpbufsize(int nOut, cudaDeviceProp* props)
+static int getLargeBinTmpbufsize(int nOut, cudaDeviceProp* props, int cuda_arch)
 {
     int nblocks;
     int hashSizelog2 = determineHashSizeLog2(sizeof(OUTPUTTYPE), &nblocks, props);
-    dim3 block = LBLOCK_SIZE;
-    dim3 grid = nblocks;
-    return (nblocks + 1) * nOut * sizeof(OUTPUTTYPE);
+    int arrLen = nblocks;
+#if USE_MEDIUM_PATH
+        if (cuda_arch >= 120 && (histotype == histogram_atomic_inc || histotype == histogram_atomic_add))
+            arrLen *= MED_THREAD_DEGEN;
+#endif
+    return (arrLen + 1) * nOut * sizeof(OUTPUTTYPE);
 }
 
 template <histogram_type histotype, int nMultires, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
@@ -1713,18 +1739,26 @@ void callHistogramKernelLargeNBins(
     }
     dim3 block = LBLOCK_SIZE;
     dim3 grid = nblocks;
+    int arrLen = nblocks;
+#if USE_MEDIUM_PATH
+        if (cuda_arch >= 120 && (histotype == histogram_atomic_inc || histotype == histogram_atomic_add))
+            arrLen *= MED_THREAD_DEGEN;
+#endif
     INDEXT nSteps = size / (INDEXT)( LBLOCK_SIZE * nblocks);
     OUTPUTTYPE* tmpOut;
     //int n = nblocks;
     if (getTmpBufSize) {
-        *getTmpBufSize = (nblocks + 1) * nOut * sizeof(OUTPUTTYPE);
+        *getTmpBufSize = (arrLen + 1) * nOut * sizeof(OUTPUTTYPE);
         return;
     }
 
-    if (tmpBuffer)
+    if (tmpBuffer){
         tmpOut = (OUTPUTTYPE*)tmpBuffer;
-    else
-        cudaMalloc((void**)&tmpOut, (nblocks + 1) * nOut * sizeof(OUTPUTTYPE));
+    }
+    else {
+        size_t allocSize = (arrLen + 1) * nOut * sizeof(OUTPUTTYPE);
+        cudaMalloc((void**)&tmpOut, allocSize);
+    }
 
     //printf("Using hash-based histogram: hashsize = %d, nblocksToT = %d\n", (1 << hashSizelog2), nblocks);
 
@@ -1754,7 +1788,7 @@ void callHistogramKernelLargeNBins(
   #define IBLOCK_SIZE_LOG2    7
   #define IBLOCK_SIZE         (1 << IBLOCK_SIZE_LOG2)
       int initPaddedSize =
-        ((nblocks * nOut) + (IBLOCK_SIZE) - 1) & (~((IBLOCK_SIZE) - 1));
+        ((arrLen * nOut) + (IBLOCK_SIZE) - 1) & (~((IBLOCK_SIZE) - 1));
       const dim3 initblock = IBLOCK_SIZE;
       dim3 initgrid = initPaddedSize >> ( IBLOCK_SIZE_LOG2 );
       int nsteps = 1;
@@ -1762,10 +1796,10 @@ void callHistogramKernelLargeNBins(
       {
           initgrid.x >>= 1;
           nsteps <<= 1;
-          if (nsteps * initgrid.x * IBLOCK_SIZE < nblocks * nOut)
+          if (nsteps * initgrid.x * IBLOCK_SIZE < arrLen * nOut)
               initgrid.x++;
       }
-      initKernel<<<initgrid,initblock,0,stream>>>(tmpOut, zero, nblocks * nOut, nsteps);
+      initKernel<<<initgrid,initblock,0,stream>>>(tmpOut, zero, arrLen * nOut, nsteps);
     }
 
 
@@ -1869,14 +1903,14 @@ void callHistogramKernelLargeNBins(
     enum cudaMemcpyKind toOut = outInDev ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
 
     if (stream != 0)
-        cudaMemcpyAsync(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
+        cudaMemcpyAsync(&tmpOut[arrLen * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut, stream);
     else
-        cudaMemcpy(&tmpOut[nblocks * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut);
+        cudaMemcpy(&tmpOut[arrLen * nOut], out, sizeof(OUTPUTTYPE) * nOut, fromOut);
     grid.x = nOut;
     //grid.x = nOut >> LBLOCK_SIZE_LOG2;
     //if ((grid.x << LBLOCK_SIZE_LOG2) < nOut) grid.x++;
     block.x = GATHER_BLOCK_SIZE;
-    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, nblocks * LBLOCK_WARPS, zero);
+    gatherKernel<<<grid, block, 0, stream>>>(sumfunObj, tmpOut, nOut, arrLen /** LBLOCK_WARPS*/, zero);
     // TODO: Async copy here also???
     if (outInDev && stream != 0)
         cudaMemcpyAsync(out, tmpOut, nOut*sizeof(OUTPUTTYPE), toOut, stream);
@@ -2090,6 +2124,7 @@ void histogramKernel_stepImpl(
      for (int resid = 4; resid < nMultires; resid++){
          ONE_HS_STEP(resid);
      }
+#undef ONE_HS_STEP
 }
 
 
@@ -2173,7 +2208,8 @@ void histogramKernel_sharedbins_new(
         (input, xformObj, sumfunObj, end, zero, nOut, startidx, bins, locks, rvals, rkeys, &doReduce, (step & 7) == 0, &warpmutex);
       startidx += HBLOCK_SIZE;
   }
-
+#undef MED_UNROLL
+#undef MED_UNROLL_LOG2
 #if HBLOCK_SIZE > 32
   __syncthreads();
 #endif
@@ -2232,7 +2268,6 @@ void callHistogramKernelImpl(
       return;
   }
   int nblocks = props->multiProcessorCount * 8;
-
 
 
   // Assert that our grid is not too large!
@@ -2443,6 +2478,458 @@ bool binsFitIntoShared(int nOut, OUTTYPE zero, cudaDeviceProp* props, int cuda_a
     return true;
   return false;
 }
+
+template <bool subHisto, histogram_type histotype, int nBinSetslog2, int nMultires, bool laststeps, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+static inline __device__
+void histogramKernel_stepImplMulti(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT end,
+    OUTPUTTYPE zero,
+    int subsize, INDEXT startidx,
+    OUTPUTTYPE* bins, int* locks,
+    OUTPUTTYPE* rvals, int* rkeys,
+    int* doReduce, bool checkReduce,
+    int* warpmutex, int binOffset)
+{
+    int myKeys[nMultires];
+    OUTPUTTYPE vals[nMultires];
+    bool doWrite = true;
+    if (laststeps){
+        if (startidx < end)
+        {
+            xformObj(input, startidx, &myKeys[0], &vals[0], nMultires);
+        }
+        else
+        {
+            doWrite = false;
+            #pragma unroll
+            for (int r = 0; r < nMultires; r++){
+                vals[r] = zero;
+                myKeys[r] = -1;
+            }
+        }
+    }
+    else
+    {
+        xformObj(input, startidx, &myKeys[0], &vals[0], nMultires);
+    }
+#if __CUDA_ARCH__ >= 200
+/*    if (laststeps){
+        *doReduce = false;
+    }
+    else*/
+    {
+         if (checkReduce){
+            *doReduce = checkForReduction<nMultires>(myKeys, rkeys);
+            if (histotype == histogram_generic || histotype == histogram_atomic_add){
+                __shared__ int tmp;
+                tmp = 0;
+                __syncthreads();
+                if (*doReduce && ((threadIdx.x & 31) == 0)) atomicAdd(&tmp, 1);
+                __syncthreads();
+                if (tmp > HMBLOCK_SIZE / 2)
+                    *doReduce = true;
+                else
+                    *doReduce = false;
+            }
+            //if (laststeps) *doReduce = false;
+/*            __syncthreads();
+            bool tmpred = checkForReduction<nMultires>(myKeys, rkeys);
+            if ((threadIdx.x & 31) == 0) atomicExch(doReduce, (int)tmpred);
+            __syncthreads();*/
+         }
+    }
+#endif
+
+     // TODO: Unroll this later - nvcc (at least older versions) can't unroll atomics (?)
+    // TODO: How to avoid bank-conflicts? Any way to avoid?
+
+
+#if __CUDA_ARCH__ >= 200
+#define ONE_HS_STEP(RESID) do { if ((RESID) < nMultires) { \
+             int keyIndex = (myKeys[(RESID % nMultires)] - binOffset); \
+             bool Iwrite = keyIndex >= 0 && keyIndex < subsize && doWrite;\
+             if (!Iwrite) keyIndex = 0; \
+             if (*doReduce){\
+                if (histotype == histogram_generic || histotype == histogram_atomic_add){\
+                    TAKE_WARP_MUTEX(0);\
+                    bool Iwrite2 = reduceToUnique<histotype, false>(&vals[(RESID % nMultires)], myKeys[(RESID % nMultires)], NULL, sumfunObj, rkeys, rvals);\
+                    if (Iwrite && Iwrite2) \
+                        bins[keyIndex] = sumfunObj(bins[keyIndex], vals[(RESID % nMultires)]);\
+                    /*if (histotype == histogram_generic) myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite && doWrite, warpmutex);\
+                    else wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite && doWrite, warpmutex);*/\
+                    GIVE_WARP_MUTEX(0);\
+                } else { \
+                    bool Iwrite2 = reduceToUnique<histotype, false>(&vals[(RESID % nMultires)], myKeys[(RESID % nMultires)], NULL, sumfunObj, rkeys, rvals);\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite && Iwrite2, warpmutex); \
+                }\
+             } else {\
+                if (!Iwrite) keyIndex = 0;\
+                if (histotype == histogram_generic)\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else if (histotype == histogram_atomic_add)\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else  if (histotype == histogram_atomic_inc)\
+                    wrapAtomicIncWarp<laststeps>(&bins[keyIndex], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else{\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                 }\
+             } } } while (0)
+#else
+#define ONE_HS_STEP(RESID) do { if ((RESID) < nMultires) { \
+                int keyIndex = (myKeys[(RESID % nMultires)] - binOffset); \
+                bool Iwrite = keyIndex >= 0 && keyIndex < subsize && doWrite;\
+                if (!Iwrite) keyIndex = 0;\
+                if (histotype == histogram_generic)\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else if (histotype == histogram_atomic_add)\
+                    wrapAtomicAddWarp<laststeps>(&bins[keyIndex], *(&vals[(RESID % nMultires)]), &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else  if (histotype == histogram_atomic_inc)\
+                    wrapAtomicIncWarp<laststeps>(&bins[keyIndex], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                else{\
+                    myAtomicWarpAdd<laststeps>(&bins[keyIndex], vals[(RESID % nMultires)], &locks[keyIndex], sumfunObj, Iwrite, warpmutex);\
+                 }\
+                } } while (0)
+#endif
+
+     ONE_HS_STEP(0);
+     ONE_HS_STEP(1);
+     ONE_HS_STEP(2);
+     ONE_HS_STEP(3);
+     //#pragma unroll
+     for (int resid = 4; resid < nMultires; resid++){
+         ONE_HS_STEP(resid);
+     }
+#undef ONE_HS_STEP
+
+
+}
+
+
+template <histogram_type histotype, int nMultires, bool lastSteps, typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE, typename OUTPUTTYPE, typename INDEXT>
+__global__
+void histogramKernel_multipass(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT start, INDEXT end,
+    OUTPUTTYPE zero,
+    OUTPUTTYPE* blockOut, int nOut,
+    int outStride,
+    int nSteps,
+    int subsize)
+{
+  extern __shared__ int cudahistogram_binstmp[];
+  OUTPUTTYPE* bins = (OUTPUTTYPE*)&(*cudahistogram_binstmp);
+
+  int* locks = (int*)&bins[subsize];
+  int* rkeys = NULL;
+  OUTPUTTYPE* rvals = NULL;
+  //__shared__
+  int warpmutex;
+  //INIT_WARP_MUTEX2(warpmutex);
+
+#if __CUDA_ARCH__ >= 200
+  int warpId = threadIdx.x >> 5;
+  if (histotype == histogram_generic)
+      rkeys = &locks[subsize];
+  else
+      rkeys = locks;
+  rvals = (OUTPUTTYPE*)&rkeys[32];
+  if (histotype == histogram_atomic_inc){
+      rkeys = &rkeys[warpId << 5];
+      //rvals = &rvals[warpId << 5];
+  }
+#endif
+  // Reset all bins to zero...
+  for (int j = 0; j < (subsize >> HMBLOCK_SIZE_LOG2) + 1; j++)
+  {
+    int bin = (j << HMBLOCK_SIZE_LOG2) + threadIdx.x;
+    if (bin < subsize){
+        bins[bin] = zero;
+    }
+  }
+#if HMBLOCK_SIZE > 32
+  __syncthreads();
+#endif
+  int outidx = blockIdx.y;
+  int binOffset = blockIdx.x * subsize;
+  INDEXT startidx = (INDEXT)((outidx * nSteps) * HMBLOCK_SIZE + start + threadIdx.x);
+
+  int doReduce; // local var - TODO: Is this safe??
+  doReduce = 0;
+
+#define MED_UNROLL_LOG2     2
+#define MED_UNROLL          (1 << MED_UNROLL_LOG2)
+  int step;
+  for (step = 0; step < (nSteps >> MED_UNROLL_LOG2); step++)
+  {
+      histogramKernel_stepImplMulti<true, histotype, 0, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, subsize, startidx, bins, locks, rvals, rkeys, &doReduce, true, &warpmutex, binOffset);
+      startidx += HMBLOCK_SIZE;
+      histogramKernel_stepImplMulti<true, histotype, 0, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, subsize, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex, binOffset);
+      startidx += HMBLOCK_SIZE;
+      histogramKernel_stepImplMulti<true, histotype, 0, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, subsize, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex, binOffset);
+      startidx += HMBLOCK_SIZE;
+      histogramKernel_stepImplMulti<true, histotype, 0, nMultires, false, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, subsize, startidx, bins, locks, rvals, rkeys, &doReduce, false, &warpmutex, binOffset);
+      startidx += HMBLOCK_SIZE;
+  }
+  step = (nSteps >> MED_UNROLL_LOG2) << MED_UNROLL_LOG2;
+  for (; step < nSteps ; step++)
+  {
+      histogramKernel_stepImplMulti<true, histotype, 0, nMultires, lastSteps, INPUTTYPE, TRANSFORMFUNTYPE, SUMFUNTYPE, OUTPUTTYPE>
+        (input, xformObj, sumfunObj, end, zero, subsize, startidx, bins, locks, rvals, rkeys, &doReduce, (step & 7) == 0, &warpmutex, binOffset);
+      startidx += HMBLOCK_SIZE;
+  }
+#undef MED_UNROLL
+#undef MED_UNROLL_LOG2
+
+#if HMBLOCK_SIZE > 32
+  __syncthreads();
+#endif
+  // Finally put together the bins
+  for (int j = 0; j < (subsize >> HMBLOCK_SIZE_LOG2) + 1; j++) {
+    int key = (j << HMBLOCK_SIZE_LOG2) + threadIdx.x;
+    if (key < subsize)
+    {
+      OUTPUTTYPE res = blockOut[(key + binOffset) * outStride + outidx];
+      //int tmpBin = bin;
+      res = sumfunObj(res, bins[key]);
+        //printf("tid:%02d, write out bin: %02d, \n", threadIdx.x, bin);
+      blockOut[(key + binOffset) * outStride + outidx] = res;
+    }
+  }
+}
+
+
+static int determineSubHistoSize(int nOut, size_t outsize, histogram_type histotype, int cuda_arch, cudaDeviceProp* props)
+{
+    int shlimit = props->sharedMemPerBlock - 300;
+    int neededPerKey = outsize;
+    if (histotype == histogram_generic || cuda_arch < 130)
+        neededPerKey += (sizeof(int)); // locks
+
+    int neededConst = 0;
+
+    if (cuda_arch >= 200)
+    {
+        // Reduction stuff:
+        if (histotype == histogram_generic || histotype == histogram_atomic_add)
+        {
+            neededConst += (outsize + sizeof(int)) << 5; // reduction values
+        }
+        else
+        {
+            neededConst += (sizeof(int) << HMBLOCK_SIZE_LOG2); // keys per warp of one thread
+        }
+    }
+    int result = (shlimit - neededConst) / (2*neededPerKey);
+    int res = 0;
+    if (result >= 1<<16) { result >>= 16; res += 16; }
+    if (result >= 1<< 8) { result >>=  8; res +=  8; }
+    if (result >= 1<< 4) { result >>=  4; res +=  4; }
+    if (result >= 1<< 2) { result >>=  2; res +=  2; }
+    if (result >= 1<< 1) {                res +=  1; }
+    return (1 << res);
+}
+
+template <histogram_type histotype, typename OUTPUTTYPE>
+static int getMultipassBufSize(int nOut, cudaDeviceProp* props, int cuda_arch)
+{
+    int subsize = determineSubHistoSize(nOut, sizeof(OUTPUTTYPE), histotype, cuda_arch, props);
+    int nDegenBlocks = nOut / subsize;
+    if (subsize * nDegenBlocks < nOut) nDegenBlocks++;
+    int nblocks = props->multiProcessorCount;
+    if (nDegenBlocks < 8)
+        nblocks = props->multiProcessorCount * 8 / nDegenBlocks;
+
+    //int nblocks = props->multiProcessorCount * 8;
+    // NOTE: The other half is used by multireduce...
+    //printf("getMultipassBufSize(%d) = %d\n", nOut, 2 * nblocks * nOut * sizeof(OUTPUTTYPE));
+    return 2 * nblocks * nOut * sizeof(OUTPUTTYPE);
+}
+
+
+
+template <histogram_type histotype, int nMultires,
+    typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
+    typename OUTPUTTYPE, typename INDEXT>
+static
+void callHistogramKernelMultiPass(
+    INPUTTYPE input,
+    TRANSFORMFUNTYPE xformObj,
+    SUMFUNTYPE sumfunObj,
+    INDEXT start, INDEXT end,
+    OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
+    cudaDeviceProp* props,
+    cudaStream_t stream,
+    void* tmpBuffer,
+    bool outInDev,
+    int cuda_arch)
+{
+  INDEXT size = end - start;
+  if (end <= start)
+      return;
+
+  //int debugs = 0;
+
+  int subsize = determineSubHistoSize(nOut, sizeof(OUTPUTTYPE), histotype, cuda_arch, props);
+  int nDegenBlocks = nOut / subsize;
+  if (subsize * nDegenBlocks < nOut) nDegenBlocks++;
+  int nblocks = props->multiProcessorCount;
+  if (nDegenBlocks < 8)
+      nblocks = props->multiProcessorCount * 8 / nDegenBlocks;
+  OUTPUTTYPE* tmpOut;
+
+  int nsteps = size / ( nblocks * HMBLOCK_SIZE );
+  if (nsteps *  nblocks * HMBLOCK_SIZE  < size) nsteps++;
+  if (nsteps > MAX_MULTISTEPS)
+      nsteps = MAX_MULTISTEPS;
+
+  //printf(" <debugstep = %d> ", debugs++);
+
+  bool userBuffer = false;
+
+  if (tmpBuffer)
+  {
+    char* tmpptr = (char*)tmpBuffer;
+    tmpOut = (OUTPUTTYPE*)tmpBuffer;
+    tmpBuffer = (void*)&tmpptr[nblocks * nOut * sizeof(OUTPUTTYPE)];
+    userBuffer = true;
+    //printf("tmpBuffer =  &tmpptr[%d]\n", nblocks * nOut * sizeof(OUTPUTTYPE));
+  }
+  else
+  {
+    cudaMalloc((void**)&tmpOut, 2 * nblocks * nOut * sizeof(OUTPUTTYPE));
+    //printf("tmpOut =  malloc(%d)\n", 2 * nblocks * nOut * sizeof(OUTPUTTYPE));
+    //tmpBuffer = (void*)&tmpOut[nblocks * nOut * sizeof(OUTPUTTYPE)];
+    //printf("tmpBuffer =  &tmpOut[%d]\n", nblocks * nOut * sizeof(OUTPUTTYPE));
+  }
+
+#define IBLOCK_SIZE_LOG2    7
+#define IBLOCK_SIZE         (1 << IBLOCK_SIZE_LOG2)
+    int initPaddedSize =
+      ((nblocks * nOut) + (IBLOCK_SIZE) - 1) & (~((IBLOCK_SIZE) - 1));
+    const dim3 initblock = IBLOCK_SIZE;
+    dim3 initgrid = initPaddedSize >> ( IBLOCK_SIZE_LOG2 );
+    int nsteps2 = 1;
+    while (initgrid.x > (1 << 14))
+    {
+        initgrid.x >>= 1;
+        nsteps2 <<= 1;
+        if (nsteps2 * initgrid.x * IBLOCK_SIZE < nblocks * nOut)
+            initgrid.x++;
+    }
+    initKernel<<<initgrid,initblock,0,stream>>>(tmpOut, zero, nblocks * nOut, nsteps2);
+#undef IBLOCK_SIZE_LOG2
+#undef IBLOCK_SIZE
+  int extSharedNeeded = subsize * (sizeof(OUTPUTTYPE)); // bins
+  if (histotype == histogram_generic || cuda_arch < 130)
+      extSharedNeeded += subsize * (sizeof(int)); // locks
+
+  if (cuda_arch >= 200)
+  {
+      // Reduction stuff:
+      if (histotype == histogram_generic || histotype == histogram_atomic_add)
+      {
+          extSharedNeeded += ((sizeof(OUTPUTTYPE) + sizeof(int)) << 5); // reduction values
+      }
+      else
+      {
+          extSharedNeeded += (sizeof(int) << HMBLOCK_SIZE_LOG2); // keys per warp of one thread
+      }
+
+  }
+
+  //printf(" <debugstep(init) = %d> ", debugs++);
+
+  /*int extSharedNeeded = ((nOut << nKeysetslog2)) * (sizeof(OUTPUTTYPE) + sizeof(int)) + (sizeof(OUTPUTTYPE) * HMBLOCK_SIZE);
+  if (nOut < HMBLOCK_SIZE) extSharedNeeded += sizeof(int) * (HMBLOCK_SIZE - nOut);
+  if (cuda_arch < 130)
+      extSharedNeeded += ((nOut << nKeysetslog2)) * (sizeof(int));*/
+  //printf("binsets = %d, steps = %d\n", (1 << nKeysetslog2), nsteps);
+  int nOrigBlocks = nblocks;
+  INDEXT myStart = start;
+  while(myStart < end)
+  {
+      bool lastStep = false;
+      if (myStart + nsteps * nblocks * HMBLOCK_SIZE > end)
+      {
+          size = end - myStart;
+          nsteps = (size) / (nblocks * HMBLOCK_SIZE);
+          if (nsteps < 1)
+          {
+              lastStep = true;
+              nsteps = 1;
+              nblocks = size / HMBLOCK_SIZE;
+              if (nblocks * HMBLOCK_SIZE < size)
+                  nblocks++;
+          }
+      }
+      dim3 grid;
+      grid.y = nblocks;
+      grid.x = nDegenBlocks;
+      dim3 block = HMBLOCK_SIZE;
+      //printf(" <debugstep(main) = %d> ", debugs++);
+      if (lastStep)
+        histogramKernel_multipass<histotype, nMultires, true><<<grid, block, extSharedNeeded, stream>>>(
+          input, xformObj, sumfunObj, myStart, end, zero, tmpOut, nOut, nOrigBlocks, nsteps, subsize);
+      else
+          histogramKernel_multipass<histotype, nMultires, false><<<grid, block, extSharedNeeded, stream>>>(
+            input, xformObj, sumfunObj, myStart, end, zero, tmpOut, nOut, nOrigBlocks, nsteps, subsize);
+      myStart += nsteps * nblocks * HMBLOCK_SIZE;
+  }
+
+#if H_ERROR_CHECKS
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror = %s\n", cudaGetErrorString( error ));
+#endif
+  // OK - so now tmpOut contains our gold - we just need to dig it out now
+  //printf(" <debugstep(out) = %d> ", debugs++);
+  //printf("callMultiReduce(%d, %d,...)\n", nOrigBlocks, nOut);
+  callMultiReduce(nOrigBlocks, nOut, out, tmpOut, sumfunObj, zero, stream, tmpBuffer, outInDev);
+  //printf(" <debugstep(multireduce) = %d> ", debugs++);
+#if H_ERROR_CHECKS
+    error = cudaGetLastError();
+    if (error != cudaSuccess)
+        printf("Cudaerror(reduce) = %s\n", cudaGetErrorString( error ));
+#endif
+
+  // Below same as host-code
+  #if 0
+  {
+    int resIdx;
+    int i;
+    OUTPUTTYPE* h_tmp = (OUTPUTTYPE*)malloc(n * nOut * sizeof(OUTPUTTYPE));
+    //parallel_copy(h_tmp, MemType_HOST, tmpOut, MemType_DEV, n * nOut * sizeof(OUTPUTTYPE));
+    cudaMemcpy(h_tmp, tmpOut, n*nOut*sizeof(OUTPUTTYPE), cudaMemcpyDeviceToHost);
+    for (resIdx = 0; resIdx < nOut; resIdx++)
+    {
+      OUTPUTTYPE res = out[resIdx];
+      for (i = 0; i < n; i++)
+      {
+        res = sumfunObj(res, h_tmp[i + resIdx * n]);
+      }
+      out[resIdx] = res;
+    }
+    free(h_tmp);
+  }
+  #endif
+  //parallel_free(tmpOut, MemType_DEV);
+  if (!userBuffer)
+    cudaFree(tmpOut);
+}
+
+
+
+
+
 
 
 template <bool lastSteps, int nMultires,
@@ -2893,8 +3380,8 @@ void callSmallBinHisto(
     else
         cudaMalloc((void**)&tmpOut, (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));
 #if H_ERROR_CHECKS
-    assert(getSmallBinBufSize<histotype, OUTPUTTYPE>(nOut, props) >=
-            (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));
+    /*assert(getSmallBinBufSize<histotype, OUTPUTTYPE>(nOut, props) >=
+            (maxblocks + 1) * nOut * sizeof(OUTPUTTYPE));*/
 #endif
 //    cudaMemset(tmpOut, 0, sizeof(OUTPUTTYPE) * nOut * (maxblocks+1));
     {
@@ -3101,6 +3588,23 @@ int DetectCudaArch(void)
     return result;
 }
 
+static bool runMultiPass(int nOut, cudaDeviceProp* props, int cuda_arch, size_t outsize, histogram_type histotype)
+{
+    int subsize = determineSubHistoSize(nOut, outsize, histotype, cuda_arch, props);
+
+    if (cuda_arch < 120){
+        if (subsize <= 0 || nOut > 2 * subsize)
+            return false;
+        return true;
+    }
+    else
+    {
+        if (subsize <= 0 || nOut > 16 * subsize)
+            return false;
+        return true;
+    }
+}
+
 
 template <histogram_type histotype, int nMultires,
     typename INPUTTYPE, typename TRANSFORMFUNTYPE, typename SUMFUNTYPE,
@@ -3128,6 +3632,8 @@ callHistogramKernel(
     enum cudaFuncCache old;
     cudaThreadGetCacheConfig(&old);
     cudaThreadSetCacheConfig(cudaFuncCachePreferShared);
+
+    if (nOut <= 0) return cudaSuccess;
     // 100 Mib printf-limit should be enough...
     // cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 1024 * 1024 * 100);
 
@@ -3135,13 +3641,17 @@ callHistogramKernel(
     {
         callSmallBinHisto<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut, &props, cuda_arch, stream, NULL, tmpBuffer, outInDev);
     }
-    else if (!binsFitIntoShared(nOut, zero, &props, cuda_arch))
+    else if (binsFitIntoShared(nOut, zero, &props, cuda_arch))
     {
-        callHistogramKernelLargeNBins<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut, &props, cuda_arch, stream, NULL, tmpBuffer, outInDev);
+        callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, NULL, tmpBuffer, outInDev, cuda_arch);
+    }
+    else if (runMultiPass(nOut, &props, cuda_arch, sizeof(OUTPUTTYPE), histotype))
+    {
+        callHistogramKernelMultiPass<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, tmpBuffer, outInDev, cuda_arch);
     }
     else
     {
-        callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, NULL, tmpBuffer, outInDev, cuda_arch);
+        callHistogramKernelLargeNBins<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut, &props, cuda_arch, stream, NULL, tmpBuffer, outInDev);
     }
     cudaThreadSetCacheConfig(old);
     return cudaSuccess;
@@ -3294,22 +3804,27 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
     int devId;
     cudaDeviceProp props;
     cudaError_t cudaErr = cudaGetDevice( &devId );
-    if (cudaErr != 0) return cudaErr;
+    if (cudaErr != 0) return -1;
     //assert(!cudaErr);
     cudaErr = cudaGetDeviceProperties( &props, devId );
-    if (cudaErr != 0) return cudaErr;
+    if (cudaErr != 0) return -1;
     int cuda_arch = DetectCudaArch();
+    if (nOut <= 0) return 0;
     if (smallBinLimit<histotype>(nOut, zero, &props, cuda_arch))
     {
         result = getSmallBinBufSize<histotype, OUTPUTTYPE>(nOut, &props);
     }
-    else if (!binsFitIntoShared(nOut, zero, &props, cuda_arch))
+    else if (binsFitIntoShared(nOut, zero, &props, cuda_arch))
     {
-        result = getLargeBinTmpbufsize<histotype, OUTPUTTYPE>(nOut, &props);
+        result = getMediumHistoTmpbufSize<histotype, OUTPUTTYPE>(nOut, &props);
+    }
+    else if (runMultiPass(nOut, &props, cuda_arch, sizeof(OUTPUTTYPE), histotype))
+    {
+        result = getMultipassBufSize<histotype, OUTPUTTYPE>(nOut, &props, cuda_arch);
     }
     else
     {
-        result = getMediumHistoTmpbufSize<histotype, OUTPUTTYPE>(nOut, &props);
+        result = getLargeBinTmpbufsize<histotype, OUTPUTTYPE>(nOut, &props, cuda_arch);
     }
     return result;
 }
@@ -3320,6 +3835,8 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 #undef H_ERROR_CHECKS
 #undef HBLOCK_SIZE_LOG2
 #undef HBLOCK_SIZE
+#undef HMBLOCK_SIZE_LOG2
+#undef HMBLOCK_SIZE
 #undef LBLOCK_SIZE_LOG2
 #undef LBLOCK_SIZE
 #undef GATHER_BLOCK_SIZE_LOG2
@@ -3329,6 +3846,7 @@ int getHistogramBufSize(OUTPUTTYPE zero, int nOut)
 #undef RMAXSTEPS
 #undef NHSTEPSPERKEY
 #undef MAX_NHSTEPS
+#undef MAX_MULTISTEPS
 #undef MAX_NLHSTEPS
 #undef STRATEGY_CHECK_INTERVAL_LOG2
 #undef STRATEGY_CHECK_INTERVAL

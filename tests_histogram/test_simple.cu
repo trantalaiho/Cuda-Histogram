@@ -20,7 +20,9 @@
  *  limitations under the License.
  *
  *
- *
+ *   Compile with:
+ *  
+ *    nvcc -O4 -arch=<your_arch> -I../ test_simple.cu -o test_simple
  *
  */
 
@@ -40,63 +42,37 @@ typedef unsigned int myuint32;
 
 
 // Do the following:
-// Consider every 32-bit input as ARGB-8888 pixels, take 8 most significant bits
-// to mean the alpha value, compute L = A * (R+G+B) in [0.0, 1.0] (where each channel
-// is floating point value between zero and one), then take floatBin = L * (255-eps),
-// highW = floatBin - floor(floatBin), lowW = 1.0 - highW, lowBin = floor(floatBin),
-// highBin = lowBin + 1. Then add result lowW to lowBin and highW to highBin.
-// Since it is more efficient to load 128-bit values on Fermi, do 4 of these passes
-// each time, which means 8 outputs for each 128-bit input.
+// Consider every 8-bit input as a 8-bit luminance value and histogram accordingly
+// Inputs come in groups of 128 bits, in order to run faster on Fermi
 struct test_xform
 {
   __host__ __device__
-  void operator() (uint4* input, int i, int* result_index, float* results, int nresults) const {
+  void operator() (uint4* input, int i, int* result_index, int* results, int nresults) const {
     uint4 idata = input[i];
+    unsigned char * data = (unsigned char *)&idata;
 #pragma unroll
-    for (int resIdx = 0; resIdx < 4; resIdx++)
-    {
-        unsigned int data = ((unsigned int*)(&idata))[resIdx];
-        int a = data >> 24;
-        int r = (data >> 16) & 0xFF;
-        int g = (data >> 8) & 0xFF;
-        int b = (data) & 0xFF;
-
-        const float scale = (1.0f - 1e-12) / (255.0f * (255.0f * 3.0f));
-        float val = ((float)(r+g+b)*a) * scale;
-
-        float floatbin = val*255.0f;
-
-        int lowbin = (int)floatbin;
-        int highbin = lowbin + 1;
-
-        float highWeight = floatbin - (float)lowbin;
-        float lowWeight = 1.0f - highWeight;
-
-         // Low result:
-        *result_index++ = lowbin & (TESTMAXIDX - 1);
-        *results++ = lowWeight;
-         // High result:
-        *result_index++ = highbin & (TESTMAXIDX - 1);
-        *results++ = highWeight;
+    for (int resIdx = 0; resIdx < 16; resIdx++){
+        *result_index++ = *data++;
+        *results++ = 1;
     }
   }
 };
 
-// Sum-functor to be used for reduction - just a normal sum of two floats
+// Sum-functor to be used for reduction - just a normal sum of two integers
 struct test_sumfun {
-    __device__ __host__ float operator() (float res1, float res2) const{
+    __device__ __host__ int operator() (int res1, int res2) const{
         return res1 + res2;
     }
 };
 
 // Helper function to print the bins of the result histogram
-static void printres (float* res, int nres, const char* descr)
+static void printres (int* res, int nres, const char* descr)
 {
     if (descr)
         printf("\n%s:\n", descr);
     printf("vals = [\n");
     for (int i = 0; i < nres; i++)
-        printf("%3f, ", res[i]);
+        printf("%d, ", res[i]);
     printf("]\n");
 }
 
@@ -179,28 +155,28 @@ int main (int argc, char** argv)
     cudaMemcpy(d_data, h_data, TEST_SIZE * sizeof(myuint32), cudaMemcpyHostToDevice);
 
     // Init the result-array on host-side to zero:
-    float results[TESTMAXIDX] = { 0 };
+    int results[TESTMAXIDX] = { 0 };
 
-    // Create the necessary function objects and run histogram using them - 8 results per input index:
+    // Create the necessary function objects and run histogram using them - 16 results per input index:
     test_xform xform;
     test_sumfun sum;
-    callHistogramKernel<histogram_atomic_add, 8>((uint4*)d_data, xform, sum, 0, TEST_SIZE/4, 0.0f, &results[0], TESTMAXIDX);
+    callHistogramKernel<histogram_atomic_add, 16>((uint4*)d_data, xform, sum, 0, TEST_SIZE/4, 0, &results[0], TESTMAXIDX);
     printres(results, TESTMAXIDX, "Results");
 
     // Confirm results using CPU:
-    float h_results[TESTMAXIDX] = { 0 };
+    int h_results[TESTMAXIDX] = { 0 };
     for (int i = 0; i < TEST_SIZE / 4;i++){
-        float res[8];
-        int indices[8];
+        int res[16];
+        int indices[16];
         xform((uint4*)h_data, i, &indices[0], &res[0], 8);
-        for (int resid = 0; resid < 8; resid++)
+        for (int resid = 0; resid < 16; resid++)
             h_results[indices[resid]] = sum(h_results[indices[resid]], res[resid]);
     }
     for (int binid = 0; binid < TESTMAXIDX; binid++)
-        if (fabs(h_results[binid] - results[binid]) > 1e-4f * fabs(0.5f*(results[binid] + h_results[binid]))){
+        if (h_results[binid] != results[binid]){
             printf("Host results differ from GPU results by more than relative 1e-4f: absolute err[%d] = %f\n",
                 binid, fabs(h_results[binid] - results[binid]));
-            printres(h_results, TESTMAXIDX, "CPU-Results:");
+            printres(h_results, TESTMAXIDX, "CPU-Results");
             return 2;
         }
     // Done: Let OS + GPU-driver+runtime worry about resource-cleanup

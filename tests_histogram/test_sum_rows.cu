@@ -20,7 +20,11 @@
  *  limitations under the License.
  *
  *
+ *    Compilation instructions:
  *
+ *     nvcc -O4 -arch=<your_arch> -I../ test_sum_rows.cu -o test_sum_rows
+ *
+ *    thrust codepath (-DTHRUST) not up to date -- do not use!
  *
  */
 
@@ -35,7 +39,12 @@
 #define START_INDEX	0
 #define NSTRESS_RUNS    NRUNS
 
-#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
+#define ENABLE_THRUST   0   // Disable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#endif
+
 
 #define USE_MULTIREDUCE_FASTPATH    0
 

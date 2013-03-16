@@ -20,7 +20,11 @@
  *  limitations under the License.
  *
  *
+ *   Compilation instructions:
  *
+ *    nvcc -O4 -arch=<your_arch> -I../ test_stress.cu -o test_stress
+ *
+ *     -DTHRUST thrust-support seems to be out of date -- DO NOT USE
  *
  */
 
@@ -32,7 +36,13 @@
 #define START_INDEX	2
 #define NSTRESS_RUNS    NRUNS
 #define START_NBINS	1
-#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
+#define ENABLE_THRUST   0   // Disable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#endif
+
 #define NBIN_INC	79
 
 #include <stdio.h>
@@ -280,6 +290,7 @@ void printUsage(void)
   printf("By default this runs on custom algorithm on the GPU\n\n");
   printf("\tOptions:\n\n");
   printf("\t\t--cpu\t\t Run on CPU serially instead of GPU\n");
+  printf("\t\t--stress\t Run the actual stress-test -- without this just one pass is done.\n");
   printf("\t\t--print\t\t Print results of algorithm (check validity)\n");
   printf("\t\t--thrust\t Run on GPU but using thrust library\n");
   printf("\t\t--fast\t Run just checksum to compare\n");

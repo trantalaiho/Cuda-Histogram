@@ -20,7 +20,9 @@
  *  limitations under the License.
  *
  *
+ *  Compile with:
  *
+ *   nvcc -O4 -arch=<your_arch> -I../ test_minimal.cu -o test_minimal
  *
  */
 

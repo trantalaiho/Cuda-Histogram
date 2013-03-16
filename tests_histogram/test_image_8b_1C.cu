@@ -5,7 +5,7 @@
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011-2012 Teemu Rantalaiho
+ *  Copyright 2011 - 2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,31 +20,20 @@
  *  limitations under the License.
  *
  *
+ * Compile with:
  *
+ * nvcc -O4 -arch=<your arch> -I../ test_image_8b_1C.cu -o test_image_8b_1C -lnpp -L /usr/local/cuda/lib64/ 
+ *  
+ *  or
  *
+ * nvcc -O4 -arch=<your arch> -I../ test_image_8b_1C.cu -DNONPP -o test_image_8b_1C
+ *
+ * Also add -DTHURST to include thrust code-path (requires thrust headers to be found of course)
  */
-
- /*
-  *     Note: This compiles by default to include NPP-based version, but not
-  *     Thrust based version - as of now, Thrust based version is not even
-  *     working correctly.
-  *
-  *     The option "--alpha" triggers a generalized histogram computation
-  *     code-path, in which we compute the image-histogram so that each
-  *     sample is weighted by its alpha-value, therefore if we have the
-  *     pixel ( r = 100, g = 100, b = 200, a = 127) we add the number 0.5 to
-  *     bins: red[100], green[100], blue[200], instead of the typical 1's,
-  *     as in normal histograms. NOTE: With this version CPU and GPU results
-  *     are bound to differ a bit, due to different order of floating point
-  *     operations (remember that floating point addition is not strictly
-  *     associative for example).
-  */
-
-
 
 #define TESTMAXIDX   256      // 256 keys / indices
 #define TEST_IS_POW2 1
-#define NRUNS 100
+#define NRUNS 1000
 
 #ifdef THRUST
 #define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
@@ -97,8 +86,7 @@
 static bool csv = false;
 
 // Always return 1 -> normal histogram - each sample has same weight
-template <int channel>
-struct test_xformChannel
+struct test_xform2
 {
   __host__ __device__
   void operator() (uint4* input, int i, int* result_index, int* results, int nresults) const {
@@ -106,19 +94,81 @@ struct test_xformChannel
 #pragma unroll
     for (int resIdx = 0; resIdx < 4; resIdx++)
     {
-        /*
-         * int r = (data >> 16) & 0xFF;
-         * int g = (data >>  8) & 0xFF;
-         * int b = (data >>  0) & 0xFF;
-         */
-        // Extract channel
         unsigned int data = ((unsigned int*)(&idata))[resIdx];
-        int result = (data >> (8 * channel)) & 0xFF;
-        *result_index++ = result;
+#if 0
+        int r = (data >> 16) & 0xFF;
+        int g = (data >>  8) & 0xFF;
+        int b = (data >>  0) & 0xFF;
+        const float scale = (float)(TESTMAXIDX - 1) / (float)(255 + 255 + 255);
+        float x = (float)(r + g + b);
+        float result = x * scale;
+        *result_index++ = (int)result;
+#else
+        *result_index++ = (data >> 24);
+        *result_index++ = (data >> 16) & 0XFF;
+        *result_index++ = (data >>  8) & 0XFF;
+        *result_index++ = (data >>  0) & 0XFF;
+#endif
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
         *results++ = 1;
     }
   }
 };
+
+typedef struct image_input_s
+{
+    uint4* image_data;
+    int stride; // in uint4 = 16 bytes
+    int height;
+} image_input;
+// Always return 1 -> normal histogram - each sample has same weight
+struct xform2dFun
+{
+  __host__ __device__
+  void operator() (image_input input, int* coords, int* result_index, int* results, int nresults) const {
+    int x = coords[0];
+    int y = coords[1];
+    int index = x + input.stride * y;
+    uint4 idata = input.image_data[index];
+#pragma unroll
+    for (int resIdx = 0; resIdx < 4; resIdx++)
+    {
+        unsigned int data = ((unsigned int*)(&idata))[resIdx];
+        *result_index++ = (data >> 24);
+        *result_index++ = (data >> 16) & 0XFF;
+        *result_index++ = (data >>  8) & 0XFF;
+        *result_index++ = (data >>  0) & 0XFF;
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
+    }
+  }
+};
+
+
+
+
+// Always return 1 -> normal histogram - each sample has same weight
+struct test_xform_old
+{
+  __host__ __device__
+  void operator() (unsigned int* input, int i, int* result_index, int* results, int nresults) const {
+    unsigned int data = input[i];
+    *result_index++ = (data >> 24);
+    *result_index++ = (data >> 16) & 0XFF;
+    *result_index++ = (data >>  8) & 0XFF;
+    *result_index++ = (data >>  0) & 0XFF;
+    *results++ = 1;
+    *results++ = 1;
+    *results++ = 1;
+    *results++ = 1;
+  }
+};
+
+
 
 struct test_sumfun2 {
   __device__ __host__
@@ -128,90 +178,38 @@ struct test_sumfun2 {
 };
 
 
-// Now return alpha/255 -> Generalized histogram - each sample has the weight of its alpha
-template <int channel>
-struct xformChannelAlpha
+static void printres (int* res, int nres, const char* descr)
 {
-  __host__ __device__
-  void operator() (uint4* input, int i, int* result_index, float* results, int nresults) const {
-    uint4 idata = input[i];
-#pragma unroll
-    for (int resIdx = 0; resIdx < 4; resIdx++)
-    {
-        /*
-         * int r = (data >> 16) & 0xFF;
-         * int g = (data >>  8) & 0xFF;
-         * int b = (data >>  0) & 0xFF;
-         */
-        // Extract channel
-        unsigned int data = ((unsigned int*)(&idata))[resIdx];
-        int result = (data >> (8 * channel)) & 0xFF;
-        int alpha =  (data >> (8 * 3)) & 0xFF;
-        *result_index++ = result;
-        *results++ = ((float)alpha) / 255.0f;
-    }
-  }
-};
-
-struct alpha_sumfun {
-  __device__ __host__
-  float operator() (float res1, float res2) const{
-    return res1 + res2;
-  }
-};
-
-
-
-
-static void printresImpl (int* res, int nres, const char* descr, bool alpha)
-{
-    float* fres = (float*)res;
     if (descr)
         printf("\n%s:\n", descr);
     if (csv)
     {
-      printf("[\n");
+      printf("vals = [\n");
       for (int i = 0; i < nres; i++)
-          if (alpha) printf("%.3f\n", fres[i]); else printf("%d\n", res[i]);
+          printf("%d\n", res[i]);
       printf("]\n");
     }
     else
     {
-      printf("[ ");
+      printf("vals = [ ");
       for (int i = 0; i < nres; i++)
-          if (alpha) printf(" %.3f, ", fres[i]); else printf(" %d, ", res[i]);
+          printf(" %d, ", res[i]);
       printf("]\n");
     }
 }
 
-static void printres (int* res, int nres, const char* descr, bool alpha)
+static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer, int width, int height, bool use2d)
 {
-    if (descr)
-        printf("\n%s:\n", descr);
-    printresImpl(res, nres/3, "Red channel", alpha);
-    printresImpl(&res[nres/3], nres/3, "Green channel", alpha);
-    printresImpl(&res[2*nres/3], nres/3, "Blue channel", alpha);
-}
-
-static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool print, bool cpurun, bool npp, void* nppSize, void* nppBuffer, void* nppResBuffer, bool alpha)
-{
-  int nIndex = TESTMAXIDX * 3;
+  int nIndex = TESTMAXIDX;
   test_sumfun2 sumFun;
-  alpha_sumfun floatSumFun;
-  test_xformChannel<0> redChannel;
-  test_xformChannel<1> greenChannel;
-  test_xformChannel<2> blueChannel;
-
-  xformChannelAlpha<0> redChannelAlpha;
-  xformChannelAlpha<1> greenChannelAlpha;
-  xformChannelAlpha<2> blueChannelAlpha;
-
-
+  test_xform2 transformFun;
+  xform2dFun xform2d;
+  image_input image;
+  image.height = height;
+  image.stride = width / 4;
+  //test_indexfun2 indexFun;
   int* tmpres = (int*)malloc(sizeof(int) * nIndex);
   int* cpures = tmpres;
-  int* redres = &tmpres[0];
-  int* greenres = &tmpres[TESTMAXIDX];
-  int* blueres = &tmpres[TESTMAXIDX*2];
   int zero = 0;
   {
     {
@@ -219,89 +217,70 @@ static void testHistogram(uint4* INPUT, uint4* hostINPUT, int nPixels,  bool pri
         printf("\nTest reduce_by_key:\n\n");
       memset(tmpres, 0, sizeof(int) * nIndex);
       if (cpurun)
-      {
-        if (alpha) for (int i = 0; i < (nPixels >> 2); i++)
+        if (use2d)
         {
-          int index[4];
-          float tmp[4];
-          float* redfres = (float*)redres;
-          float* greenfres = (float*)greenres;
-          float* bluefres = (float*)blueres;
-          redChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              redfres[index[tmpi]] = floatSumFun(redfres[index[tmpi]], tmp[tmpi]);
-          greenChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              greenfres[index[tmpi]] = floatSumFun(greenfres[index[tmpi]], tmp[tmpi]);
-          blueChannelAlpha(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              bluefres[index[tmpi]] = floatSumFun(bluefres[index[tmpi]], tmp[tmpi]);
-          //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+            image.image_data = hostINPUT;
+            for (int y = 0; y < height; y++)
+            for (int x = 0; x < width/4; x++)
+            {
+                int index[16];
+                int tmp[16];
+                int coord[2] = { x, y };
+                xform2d(image, coord, &index[0], &tmp[0], 16);
+                for (int tmpi = 0; tmpi < 16; tmpi++)
+                    cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
+            }
         }
-        else  for (int i = 0; i < (nPixels >> 2); i++)
+        else
         {
-          int index[4];
-          int tmp[4];
-          redChannel(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              redres[index[tmpi]] = sumFun(redres[index[tmpi]], tmp[tmpi]);
-          greenChannel(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              greenres[index[tmpi]] = sumFun(greenres[index[tmpi]], tmp[tmpi]);
-          blueChannel(hostINPUT, i, &index[0], &tmp[0], 4);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
-              blueres[index[tmpi]] = sumFun(blueres[index[tmpi]], tmp[tmpi]);
-
-          //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+            for (int i = 0; i < (nPixels >> 2); i++)
+            {
+              int index[16];
+              int tmp[16];
+              transformFun(hostINPUT, i, &index[0], &tmp[0], 16);
+              for (int tmpi = 0; tmpi < 16; tmpi++)
+                  cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
+              //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
+            }
         }
-      }
       if (print && cpurun)
       {
-          printres(cpures, nIndex, "CPU results:", alpha);
+          printres(cpures, nIndex, "CPU results:");
       }
     }
 
     if (!cpurun && !npp)
     {
-      int* tmpbuf = (int*)nppResBuffer;
-      int* redgpures = &tmpbuf[0];
-      int* greengpures = &tmpbuf[TESTMAXIDX];
-      int* bluegpures = &tmpbuf[TESTMAXIDX*2];
-      if (alpha)
-      {
-        float fzero = 0.0f;
-        callHistogramKernel<histogram_atomic_add, 4>(INPUT, redChannelAlpha,  floatSumFun, 0, (nPixels >> 2), fzero, (float*)redgpures, TESTMAXIDX, true, 0, nppBuffer);
-        callHistogramKernel<histogram_atomic_add, 4>(INPUT, greenChannelAlpha, floatSumFun, 0, (nPixels >> 2), fzero, (float*)greengpures, TESTMAXIDX, true, 0, nppBuffer);
-        callHistogramKernel<histogram_atomic_add, 4>(INPUT, blueChannelAlpha, floatSumFun, 0, (nPixels >> 2), fzero, (float*)bluegpures, TESTMAXIDX, true, 0, nppBuffer);
-      }
-      else
-      {
-        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, redChannel, sumFun, 0, (nPixels >> 2), zero, redgpures, TESTMAXIDX, true, 0, nppBuffer);
-        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, greenChannel, sumFun, 0, (nPixels >> 2), zero, greengpures, TESTMAXIDX, true, 0, nppBuffer);
-        callHistogramKernel<histogram_atomic_inc, 4>(INPUT, blueChannel, sumFun, 0, (nPixels >> 2), zero, bluegpures, TESTMAXIDX, true, 0, nppBuffer);
-      }
-      cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * nIndex, cudaMemcpyDeviceToHost);
+        if (!use2d){
+#if FOR_PRE_FERMI
+            callHistogramKernel<histogram_atomic_inc, 4>((unsigned int*)INPUT, transformFunOld, /*indexFun,*/ sumFun, 0, (nPixels), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+#else
+            callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFun, /*indexFun,*/ sumFun, 0, (nPixels >> 2), zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+#endif
+        }
+        else
+        {
+            image.image_data = INPUT;
+            callHistogramKernel2Dim<histogram_atomic_inc, 16>(image, xform2d, sumFun, 0, width/4, 0, height, zero, (int*)nppResBuffer, nIndex, true, 0, nppBuffer);
+        }
+      cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * TESTMAXIDX, cudaMemcpyDeviceToHost);
     }
     else if (npp)
     {
 #if ENABLE_NPP
         NppiSize oSizeROI = *(NppiSize*)nppSize;
         Npp8u* pDeviceBuffer = (Npp8u*)nppBuffer;
-        Npp32s* histograms[3] = { (Npp32s*)nppResBuffer, ((Npp32s*)nppResBuffer) + TESTMAXIDX, ((Npp32s*)nppResBuffer) + 2*TESTMAXIDX };
-        int level[3] = { TESTMAXIDX + 1, TESTMAXIDX + 1, TESTMAXIDX + 1 };
-        int lowlevel[3] = { 0, 0, 0 };
-        int uplevel[3] = { TESTMAXIDX, TESTMAXIDX, TESTMAXIDX };
-        nppiHistogramEven_8u_AC4R(
-            (Npp8u*)INPUT, oSizeROI.width << 2, oSizeROI,
-            histograms, level, lowlevel, uplevel,
+        nppiHistogramEven_8u_C1R(
+            (Npp8u*)INPUT, oSizeROI.width, oSizeROI,
+            (Npp32s*)nppResBuffer, TESTMAXIDX + 1, 0, TESTMAXIDX,
             pDeviceBuffer);
-        cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * nIndex, cudaMemcpyDeviceToHost);
+        cudaMemcpy(tmpres, nppResBuffer, sizeof(int) * TESTMAXIDX, cudaMemcpyDeviceToHost);
 #endif
     }
 
     if (print && (!cpurun))
     {
-      printres(tmpres, nIndex, "GPU results:", alpha);
+      printres(tmpres, nIndex, "GPU results:");
     }
 
   }
@@ -358,15 +337,16 @@ void printUsage(void)
   printf("\t\t--npp\t\t Use NVIDIA Performance Primitives library (NPP) instead.\n");
   printf("\t\t--3ch\t\t Assume 24bits/pixel interleaved RGB data (default).\n");
   printf("\t\t--4ch\t\t Assume 32bits/pixel interleaved ARGB data.\n");
-  printf("\t\t--alpha\t\t Compute generalized histogram with alpha value as pixel weight.\n");
-  printf("\t\t--load <name>\t Use 32-bit texture data s\n");
+
+  printf("\t\t--load <name>\t Use 32-bit texture data\n");
+  printf("\t\t--2d\t\t Run histogram using 2d-indexing\n");
 }
 
 
 
 
 
-static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
+static void fillInput(int* input, const char* filename, int nPixels, bool ch4, bool header)
 {
   FILE* file = fopen(filename, "rb");
   //texture->dataRGBA8888 = NULL;
@@ -389,10 +369,12 @@ static void fillInput(int* input, const char* filename, int nPixels, bool ch4)
       if (data)
       {
           int i;
+          if (header) fseek(file, 16, SEEK_SET);
           for (i = 0; i < nPixels; i++)
           {
               unsigned int raw = 0;
               int bytesPerPixel = ch4 ? 4 : 3;
+
               int rsize = fread(&raw, bytesPerPixel, 1, file);
               if (rsize != 1)
               {
@@ -427,7 +409,7 @@ int main (int argc, char** argv)
   bool thrust = false;
   bool npp = false;
   bool ch4 = false;
-  bool alpha = false;
+  bool use2d = false;
 
   const char* name = "feli.raw";
 
@@ -449,15 +431,17 @@ int main (int argc, char** argv)
       ch4 = true;
     else if (argv[i] && strcmp(argv[i], "--3ch") == 0)
       ch4 = false;
-    else if (argv[i] && strcmp(argv[i], "--alpha") == 0)
-      alpha = true;
+    else if (argv[i] && strcmp(argv[i], "--2d") == 0)
+      use2d = true;
     else if (argv[i] && strcmp(argv[i], "--load") == 0)
     {
       if (argc > i + 1)
         name = argv[i + 1];
     }
   }
-
+  int width = 0;
+  int height = 0;
+  int nchannels = 0;
   {
 
     int nPixels = 0;
@@ -466,11 +450,27 @@ int main (int argc, char** argv)
       FILE* file = fopen(name, "rb");
       int error = -1;
       long filesize = 0;
+      int token = 0;
       if (file)
-        error = fseek(file, 0, SEEK_END);
+      {
+          // Check header first:
+          int check = fread(&token, 4, 1, file);
+          if (token == -2999999)
+          {
+              check += fread(&width, 4, 1, file);
+              check += fread(&height, 4, 1, file);
+              check += fread(&nchannels, 4, 1, file);
+              if (check != 4){
+                  printf("Error reading image header!\n");
+                  error = -2;
+              }
+          }
+          error = fseek(file, 0, SEEK_END);
+      }
       if (error == 0)
       {
         filesize = ftell(file);
+        if (token == -2999999) filesize -= 16;
         printf("File: %s, filesize = %ld\n", name, filesize);
         fclose(file);
         if (ch4)
@@ -492,6 +492,7 @@ int main (int argc, char** argv)
 
     // Allocate keys:
     int* INPUT = NULL;
+
     int* hostINPUT = (int*)malloc(sizeof(int) * nPixels);
     void* nppBuffer = NULL;
     void* nppResBuffer = NULL;
@@ -501,14 +502,16 @@ int main (int argc, char** argv)
     nppSize = &oSizeROI;
 #endif
     assert(hostINPUT);
-    fillInput(hostINPUT, name, nPixels, ch4);
+    if (nchannels == 4) ch4 = true;
+    else if (nchannels == 3) ch4 = false;
+    fillInput(hostINPUT, name, nPixels, ch4, nchannels > 0);
     if (!cpu)
     {
       cudaMalloc(&INPUT, sizeof(int) * nPixels);
       assert(INPUT);
       cudaMemcpy(INPUT, hostINPUT, sizeof(int) * nPixels, cudaMemcpyHostToDevice);
-      cudaMalloc(&nppResBuffer, sizeof(int) * TESTMAXIDX * 3);
-      cudaMemset(nppResBuffer, 0, sizeof(int) * TESTMAXIDX * 3);
+      cudaMalloc(&nppResBuffer, sizeof(int) * TESTMAXIDX);
+      cudaMemset(nppResBuffer, 0, sizeof(int) * TESTMAXIDX);
     }
     // Create events for timing:
     cudaEvent_t start, stop;
@@ -522,27 +525,30 @@ int main (int argc, char** argv)
             return 2;
       #else
             int nDeviceBufferSize;
-            int levelCounts[] = {TESTMAXIDX + 1, TESTMAXIDX + 1, TESTMAXIDX + 1 };
+            int levelCount = TESTMAXIDX + 1;
             // Start guessing from 4096 and div by two
-            int width = 4096;
-            int height = nPixels / width;
-            while (width > 128)
+            if (width == 0)
             {
-                if (width * height == nPixels)
-                    break;
-                width >>= 1;
+                width = 4096;
                 height = nPixels / width;
+                while (width > 128)
+                {
+                    if (width * height == nPixels)
+                        break;
+                    width >>= 1;
+                    height = nPixels / width;
+                }
             }
-            oSizeROI.width = width;
+            oSizeROI.width = width*4;
             oSizeROI.height = height;
-            nppiHistogramEvenGetBufferSize_8u_AC4R(oSizeROI, levelCounts ,&nDeviceBufferSize);
+            nppiHistogramEvenGetBufferSize_8u_C1R(oSizeROI, levelCount ,&nDeviceBufferSize);
             cudaMalloc(&nppBuffer, nDeviceBufferSize);
       #endif
     }
     else
     {
         int zero = 0;
-        int tmpbufsize = getHistogramBufSize<histogram_atomic_inc>(zero , (int)(TESTMAXIDX));
+        int tmpbufsize = getHistogramBufSize<histogram_atomic_inc>(zero , (int)TESTMAXIDX);
         cudaMalloc(&nppBuffer, tmpbufsize);
     }
 
@@ -562,7 +568,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer, alpha);
+        testHistogram((uint4*)INPUT, (uint4*)hostINPUT, nPixels, print, cpu, npp, nppSize, nppBuffer, nppResBuffer, width, height, use2d);
       }
       print = false;
       // Run only once all stress-tests
@@ -573,7 +579,7 @@ int main (int argc, char** argv)
         cudaThreadSynchronize();
         cudaEventElapsedTime(&t_ms, start, stop);
         double t = t_ms * 0.001f;
-        double GKps = (((double)nPixels * (double)NRUNS * 3.0)) / (t*1.e9);
+        double GKps = (((double)nPixels * (double)NRUNS * 4.0)) / (t*1.e9);
         printf("Runtime in loops: %fs, Thoughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
     if (INPUT) cudaFree(INPUT);

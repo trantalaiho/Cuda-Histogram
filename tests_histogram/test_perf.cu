@@ -20,11 +20,16 @@
  *  limitations under the License.
  *
  *
+ *  Compile with:
+ *
+ *   nvcc -O4 -arch=<your_arch> -I../ test_perf.cu -o test_perf
+ *
+ *  Optionally include thrust codepath with -DTHRUST
  *
  *
  */
 
-#define TEST_SIZE (625 * 100 * 1000)    // Multiply this by 16 to get size in bytes
+#define TEST_SIZE (625 * 10 * 1000)    // Multiply this by 16 to get size in bytes
 
 // Seems like the other codepath is always better - so disable this one by setting limit to zero
 #define SMALL_HISTO_LIMIT   0 // 1000 * 1000 // If there are less than 16million inputs (~4096x4096)
@@ -49,7 +54,11 @@ const int checkNBins[] =
     32768, 65536, 131072
 };
 
-#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
+#define ENABLE_THRUST   0
+#endif
 
 
 #include "cuda_histogram.h"
@@ -65,6 +74,9 @@ const int checkNBins[] =
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/sort.h>
+#include <thrust/binary_search.h>
+#include <thrust/adjacent_difference.h>
+#include <thrust/inner_product.h>
 #endif
 
 #include <assert.h>
@@ -273,37 +285,70 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
 }
 
 #if ENABLE_THRUST
-
-// NOTE: Take advantage here of the fact that this is the classical histogram with all values = 1
-// And also that we know before hand the number of indices coming out
-static void testHistogramParamThrust(int* INPUT, int index_0, int index_1, bool print)
+static void testHistogramParamThrust(unsigned char* INPUT, int index_0, int index_1, bool print, int nIndex)
 {
-  test_sumfun2 mysumfun;
-  thrust::equal_to<int> binary_pred;
-  int nIndex = TESTMAXIDX;
   int N = index_1 - index_0;
-  thrust::device_vector<int> keys_out(nIndex);
   thrust::device_vector<int> vals_out(nIndex);
-  thrust::device_vector<int> h_vals_out(nIndex);
+  thrust::host_vector<int> h_vals_out(nIndex);
+  //thrust::device_vector<int> keys(N);
+  thrust::device_ptr<unsigned char> keys(INPUT);
+  // Sort the data
+  thrust::sort(keys, keys + N);
+  // And reduce by key - histogram complete
+#if 0
+  // Note: This codepath is somewhat slow
+  test_sumfun2 mysumfun;
+  thrust::device_vector<int> keys_out(nIndex);
+  thrust::equal_to<int> binary_pred;
+  thrust::reduce_by_key(keys, keys + N, thrust::make_constant_iterator(1), keys_out.begin(), vals_out.begin(), binary_pred, mysumfun);
+#else
+  // This is taken from the thrust histogram example
+  thrust::counting_iterator<int> search_begin(0);
+  // Find where are the upper bounds of consecutive keys as indices (ie. partition function)
+  thrust::upper_bound(keys, keys + N,
+                      search_begin, search_begin + nIndex,
+                      vals_out.begin());
+// compute the histogram by taking differences of the partition function (cumulative histogram)
+  thrust::adjacent_difference(vals_out.begin(), vals_out.end(),
+                              vals_out.begin());
+#endif
+  h_vals_out = vals_out;
+  if (print)
+      printres(&h_vals_out[0], nIndex, "Thrust results");
+}
+
+static void testHistogramParamThrustInt(int* INPUT, int index_0, int index_1, bool print, int nIndex)
+{
+  int N = index_1 - index_0;
+  thrust::device_vector<int> vals_out(nIndex);
+  thrust::host_vector<int> h_vals_out(nIndex);
   //thrust::device_vector<int> keys(N);
   thrust::device_ptr<int> keys(INPUT);
   // Sort the data
   thrust::sort(keys, keys + N);
   // And reduce by key - histogram complete
+#if 0
+  // Note: This codepath is somewhat slow
+  test_sumfun2 mysumfun;
+  thrust::device_vector<int> keys_out(nIndex);
+  thrust::equal_to<int> binary_pred;
   thrust::reduce_by_key(keys, keys + N, thrust::make_constant_iterator(1), keys_out.begin(), vals_out.begin(), binary_pred, mysumfun);
+#else
+  // This is taken from the thrust histogram example
+  thrust::counting_iterator<int> search_begin(0);
+  // Find where are the upper bounds of consecutive keys as indices (ie. partition function)
+  thrust::upper_bound(keys, keys + N,
+                      search_begin, search_begin + nIndex,
+                      vals_out.begin());
+// compute the histogram by taking differences of the partition function (cumulative histogram)
+  thrust::adjacent_difference(vals_out.begin(), vals_out.end(),
+                              vals_out.begin());
+#endif
   h_vals_out = vals_out;
   if (print)
-  {
-    printf("\nThrust results:\n");
-    printf("vals = [ ");
-    for (int i = 0; i < nIndex; i++)
-    {
-        int tmp = h_vals_out[i];
-        printf("(%d), ", tmp);
-    }
-    printf("]\n");
-  }
+      printres(&h_vals_out[0], nIndex, "Thrust results");
 }
+
 #endif
 
 void printUsage(void)
@@ -561,7 +606,15 @@ int main (int argc, char** argv)
         if (thrust)
         {
           #if ENABLE_THRUST
-            testHistogramParamThrust(INPUT, index_0, index_1, print);
+            int* tmpin;
+            cudaMalloc(&tmpin, 4 * sizeof(int) * TEST_SIZE);
+            for (int run = 0; run < NRUNS; run++){
+              cudaMemcpy(tmpin, INPUT, 4 * sizeof(int) * TEST_SIZE, cudaMemcpyDeviceToDevice);
+              if (nIndices <= 256)
+               testHistogramParamThrust((unsigned char*)tmpin, 16*index_0, 16*index_1, print, nIndices);
+              else
+               testHistogramParamThrustInt(tmpin, 4*index_0, 4*index_1, print, nIndices);
+            }
           #else
             printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
             break;

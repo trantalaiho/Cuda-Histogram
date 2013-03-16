@@ -29,6 +29,13 @@
   *     Thrust based version - as of now, Thrust based version is not even
   *     working correctly.
   *
+  *  Compile with:
+  *
+  *  nvcc -O4 -arch=<your_arch> -I../ test_image_8b_4C.cu -o test_image_8b_4C -lnpp -L /usr/local/cuda/lib64/
+  *
+  *  or without NPP (NVIDIA Performance Primitives):
+  * 
+  *  nvcc -O4 -arch=<your_arch> -DNONPP -I../ test_image_8b_4C.cu -o test_image_8b_4C
   *
   */
 

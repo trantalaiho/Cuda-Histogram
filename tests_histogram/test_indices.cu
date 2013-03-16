@@ -1,11 +1,11 @@
 /*
+ * test.cu
  *
- *
- *  Created on: 27.6.2011
+ *  Created on: 8.3.2012
  *      Author: Teemu Rantalaiho (teemu.rantalaiho@helsinki.fi)
  *
  *
- *  Copyright 2011 Teemu Rantalaiho
+ *  Copyright 2012 Teemu Rantalaiho
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,28 @@
  *
  */
 
-#define TESTMAXIDX   6855      // 16 keys / indices
-#define TEST_IS_POW2 0
-#define TEST_SIZE (1)   // 1000 million inputs
-#define NRUNS 334          // Repeat 100 times => 100 gigainputs
-#define START_INDEX	2
+/*
+ *
+ * Compile with:
+ *
+ *  nvcc -O4 -arch=<your_arch> -I../ test_indices.cu -o test_indices
+ *
+ *  Optionally include -DTHRUST to enable thrust codepath
+ */
+
+
+#define TESTMAXIDX      32            // 32 keys / indices
+#define NRUNS           40           // Repeat 40 times
+#define TEST_SIZE       (20 * 1000 * 1000)   // 20 million inputs
+#define START_INDEX	    (1ull << 33) // Big number
 #define NSTRESS_RUNS    NRUNS
-#define START_NBINS	1
+
+#ifdef THRUST
+#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+#else
 #define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-#define NBIN_INC	79
-#include <assert.h>
-#include <stdio.h>
+#endif
+
 #include "cuda_histogram.h"
 
 #if ENABLE_THRUST
@@ -47,88 +58,28 @@
 #include <thrust/sort.h>
 #endif
 
+#include <assert.h>
+#include <stdio.h>
 
 
 typedef struct myTestType_s
 {
-  int real;
+  unsigned long long real;
   int imag;
 } myTestType;
 
-#define TEST_JENKINS_MIX(A, B, C)  \
-do {                                \
-  A -= B; A -= C; A ^= (C>>13);     \
-  B -= C; B -= A; B ^= (A<<8);      \
-  C -= A; C -= B; C ^= (B>>13);     \
-  A -= B; A -= C; A ^= (C>>12);     \
-  B -= C; B -= A; B ^= (A<<16);     \
-  C -= A; C -= B; C ^= (B>>5);      \
-  A -= B; A -= C; A ^= (C>>3);      \
-  B -= C; B -= A; B ^= (A<<10);     \
-  C -= A; C -= B; C ^= (B>>15);     \
-} while (0)
 
 struct test_xform2
 {
   __host__ __device__
-  void operator() (int input, size_t i, int* result_index, myTestType* result, int nRes) const {
-    //int tmp = 1013904223;
-    result[0].real = 1;//(i & 0x1) != 0 ? 1 : i;
-    result[0].imag = i - 10000;//(i & 0x1) != 0 ? 1 : i;
-    result[1].real = i - input;//(i & 0x1) != 0 ? 1 : i;
-    result[1].imag = 2;//(i & 0x1) != 0 ? 1 : i;
-    result[2].real = (result[0].real + result[1].real) >> 1;//(i & 0x1) != 0 ? 1 : i;
-    result[2].imag = (result[0].imag + result[1].imag) >> 1;//(i & 0x1) != 0 ? 1 : i;
-    // NOTE: Use i directly instead of x to reveal a nasty compiler bug in nvcc v. 3.2.16 with -arch=sm_20
-    int x = i;
-    if (0 && (i & 15 == 0))
-    {
-      int a = 1013904223;
-      int b = 1013904223;
-      TEST_JENKINS_MIX(a,b,x);
-    }
-    else if ((i & 0x7) != 0)
-    {
-      x = x >> 10;
-    }
-    if (x < 0) x = -x;
-    result_index[0] = x % input;
-    if (0 && (x & 15 == 0))
-    {
-      int a = 1013904223;
-      int b = 1013904223;
-      TEST_JENKINS_MIX(a,b,x);
-    }
-    else if ((x & 0x7) != 0)
-    {
-      x = x >> 10;
-    }
-    if (x < 0) x = -x;
-    result_index[1] =  x % input;
-
-    if (0 && (x & 15 == 0))
-    {
-      int a = 1013904223;
-      int b = 1013904223;
-      TEST_JENKINS_MIX(a,b,x);
-    }
-    else if ((x & 0x7) != 0)
-    {
-      x = x >> 10;
-    }
-    if (x < 0) x = -x;
-    result_index[2] =  x % input;
-
-/*    tmp = i + input;
+  void operator() (int input, unsigned long long i, int* result_index, myTestType* results, int nRes) const {
+    int tmp;
+    results->real = i;
+    results->imag = input;
+    tmp = 10*i*i/(100+i) - i + input;
     if (tmp < 0)
       tmp = -tmp;
-    // divide by 16
-    //tmp >>= 4;
-#if !TEST_IS_POW2
     *result_index = tmp % TESTMAXIDX;
-#else
-    *result_index = tmp & (TESTMAXIDX-1);
-#endif*/
   }
 };
 
@@ -149,13 +100,13 @@ static void printres (myTestType* res, int nres, const char* descr)
         printf("\n%s:\n", descr);
     printf("vals = [ ");
     for (int i = 0; i < nres; i++)
-        printf("(%d, %d), ", res[i].real, res[i].imag);
+        printf("(%llu, %d), ", res[i].real, res[i].imag);
     printf("]\n");
 }
 
-static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, bool cpurun, bool stress)
+static void testHistogramParam(int INPUT, unsigned long long index_0, unsigned long long index_1, bool print, bool cpurun, bool stress)
 {
-  int nIndex = INPUT;
+  int nIndex = TESTMAXIDX;
   int srun;
   int nruns = stress ? NSTRESS_RUNS : 1;
   test_sumfun2 sumFun;
@@ -167,20 +118,20 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
   for (srun = 0; srun < nruns; srun++)
   {
     {
+      int* tmpidx = (int*)malloc(sizeof(int) * nIndex);
       if (print)
         printf("\nTest reduce_by_key:\n\n");
       memset(tmpres, 0, sizeof(myTestType) * nIndex);
       if (stress)
           memset(cpures, 0, sizeof(myTestType) * nIndex);
       if (cpurun || stress)
-        for (int i = index_0; i < index_1; i++)
+        for (unsigned long long i = index_0; i < index_1; i++)
         {
-          int index[3];
-          myTestType tmp[3];
-          transformFun(INPUT, i, &index[0], &tmp[0], 3);
+          int index;
+          myTestType tmp;
+          transformFun(INPUT, i, &index, &tmp, 1);
           //index = indexFun(INPUT, i);
-          for (int j = 0; j < 3; j++)
-            cpures[index[j]] = sumFun(cpures[index[j]], tmp[j]);
+          cpures[index] = sumFun(cpures[index], tmp);
           //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
         }
       if (print && cpurun)
@@ -189,9 +140,9 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
       }
     }
 
-    if (stress) printf(" %d ", index_1 - index_0);
     if (!cpurun)
-      callHistogramKernel<histogram_generic, 3>(INPUT, transformFun, /*indexFun,*/ sumFun, index_0, index_1, zero, tmpres, nIndex);
+      callHistogramKernel<histogram_generic, 1>
+        (INPUT, transformFun, sumFun, index_0, index_1, zero, tmpres, nIndex);
 
     if (stress)
     {
@@ -200,10 +151,10 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
         {
             if (tmpres[k].real != cpures[k].real || tmpres[k].imag != cpures[k].imag)
             {
-                printf("Error detected with index-values: i0 = %d, i1 = %d, nbins = %d!\n", index_0, index_1, nIndex);
+                printf("Error detected with index-values: i0 = %d, i1 = %d!\n", index_0, index_1);
                 printres(cpures, nIndex, "CPU results:");
                 printres(tmpres, nIndex, "GPU results:");
-                return false;
+                break;
             }
         }
     }
@@ -213,40 +164,34 @@ static bool testHistogramParam(int INPUT, int index_0, int index_1, bool print, 
       printres(tmpres, nIndex, "GPU results:");
     }
     int size  = index_1 - index_0;
-    //index_0 += size;
-    index_1 += 1;
-    if (srun % 23 == 19)
-        index_1 +=  (4 * size / 3) + (size % 73);
-    if (index_0 < 0 || index_1 < 0) {
-      index_0 = 0;
-      index_1 = size - 1;
-    }
+    index_0 += size;
+    index_1 += size + 1;
   }
   free(tmpres);
   if (stress)
     free(cpures);
-  return true;
 }
 
 #if ENABLE_THRUST
 struct initFunObjType
 {
   __device__ __host__
-  thrust::tuple<int, myTestType> operator() (thrust::tuple<int, int> t) const {
+  thrust::tuple<int, myTestType> operator() (thrust::tuple<int, unsigned long long> t) const {
     int INPUT = thrust::get<0>(t);
-    int index = thrust::get<1>(t);
+    unsigned long long index = thrust::get<1>(t);
     test_xform2 xformFun;
     int out_index;
-    myTestType res = xformFun(INPUT, index, &out_index);
+    myTestType res;
+    xformFun(INPUT, index, &out_index, &res, 1);
     return thrust::make_tuple(out_index, res);
   }
 };
 
 static
-void initialize(thrust::device_vector<int>& keys, thrust::device_vector<myTestType>& vals, int index_0, int index_1, int INPUT)
+void initialize(thrust::device_vector<int>& keys, thrust::device_vector<myTestType>& vals, unsigned long long index_0, unsigned long long index_1, int INPUT)
 {
-thrust::counting_iterator<int, thrust::device_space_tag> idxBegin(index_0);
-thrust::counting_iterator<int, thrust::device_space_tag> idxEnd(index_1);
+thrust::counting_iterator<unsigned long long, thrust::device_space_tag> idxBegin(index_0);
+thrust::counting_iterator<unsigned long long, thrust::device_space_tag> idxEnd(index_1);
 initFunObjType initFun;
     thrust::transform(
         thrust::make_zip_iterator(make_tuple(
@@ -260,15 +205,15 @@ initFunObjType initFun;
 
 }
 
-static void testHistogramParamThrust(int INPUT, int index_0, int index_1, bool print)
+static void testHistogramParamThrust(int INPUT, unsigned long long index_0, unsigned long long index_1, bool print)
 {
   test_sumfun2 mysumfun;
   thrust::equal_to<int> binary_pred;
   int nIndex = TESTMAXIDX;
-  int N = index_1 - index_0;
+  unsigned long long N = index_1 - index_0;
   thrust::device_vector<int> keys_out(nIndex);
   thrust::device_vector<myTestType> vals_out(nIndex);
-  thrust::device_vector<myTestType> h_vals_out(nIndex);
+  thrust::host_vector<myTestType> h_vals_out(nIndex);
   thrust::device_vector<int> keys(N);
   thrust::device_vector<myTestType> values(N);
   initialize(keys, values, index_0, index_1, INPUT);
@@ -277,14 +222,7 @@ static void testHistogramParamThrust(int INPUT, int index_0, int index_1, bool p
   h_vals_out = vals_out;
   if (print)
   {
-    printf("\nThrust results:\n");
-    printf("vals = [ ");
-    for (int i = 0; i < nIndex; i++)
-    {
-      myTestType tmp = h_vals_out[i];
-        printf("(%d), ", tmp.real);
-    }
-    printf("]\n");
+    printres(&h_vals_out[0], nIndex, "Thrust results:");
   }
 }
 #endif
@@ -303,8 +241,8 @@ void printUsage(void)
 int main (int argc, char** argv)
 {
   int i;
-  int index_0 = START_INDEX;
-  int index_1 = index_0 + TEST_SIZE;
+  unsigned long long index_0 = START_INDEX;
+  unsigned long long index_1 = index_0 + TEST_SIZE;
   int INPUT = 1;
 
   bool cpu = false;
@@ -316,38 +254,32 @@ int main (int argc, char** argv)
 
   for (i = 0; i < argc; i++)
   {
-    if (argv[i] && strcmp(argv[i], "--print") == 0)
-      print = true;
-    if (argv[i] && strcmp(argv[i], "--stress") == 0)
-      stress = true;
     if (argv[i] && strcmp(argv[i], "--cpu") == 0)
       cpu = true;
+    if (argv[i] && strcmp(argv[i], "--print") == 0)
+      print = true;
     if (argv[i] && strcmp(argv[i], "--thrust") == 0)
       thrust = true;
+    if (argv[i] && strcmp(argv[i], "--stress") == 0)
+      stress = true;
   }
-  for (INPUT = START_NBINS; INPUT < TESTMAXIDX; INPUT+=NBIN_INC)
+  for (i = 0; i < NRUNS; i++)
   {
-      for (i = 0; i < NRUNS; i++)
-      {
-        if (thrust)
-        {
-          #if ENABLE_THRUST
-            testHistogramParamThrust(INPUT, index_0, index_1, print, stress);
-          #else
-            printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
-            break;
-          #endif
-        }
-        else
-        {
-          bool success = testHistogramParam(INPUT, index_0, index_1, print, cpu, stress);
-          if (!success) return 1;
-        }
-        print = false;
-        // Run only once all stress-tests
-        if (stress) break;
-      }
-      if (!stress) break;
+    if (thrust)
+    {
+      #if ENABLE_THRUST
+        testHistogramParamThrust(INPUT, index_0, index_1, print);
+      #else
+        printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
+        break;
+      #endif
+    }
+    else
+    {
+      testHistogramParam(INPUT, index_0, index_1, print, cpu, stress);
+    }
+    print = false;
+    // Run only once all stress-tests
+    if (stress) break;
   }
-  return 0;
 }

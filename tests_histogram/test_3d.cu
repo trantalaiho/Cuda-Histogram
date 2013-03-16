@@ -25,7 +25,11 @@
  */
 
 /*
- *  Video file header is the following:
+ *
+ * Compile with: nvcc -O4 -arch=<your arch> -I../ test_3d.cu -o test3d
+ * Needs lemon.mvd to be present in the runtime directory 
+ * 
+ * Video file header is the following:
  *
  *    All variables little-endian 32-bit two's complement signed integers (ie. normal ints on x86)
  *       - VIDEO_HEADER     (-2777777)
@@ -384,14 +388,19 @@ int main (int argc, char** argv)
       if (file)
       {
           // Check header first:
-          fread(&token, 4, 1, file);
+          int check;
+          check = fread(&token, 4, 1, file);
           if (token == VIDEO_HEADER)
           {
-              fread(&headerSize, 4, 1, file);
-              fread(&width, 4, 1, file);
-              fread(&height, 4, 1, file);
-              fread(&frames, 4, 1, file);
-              fread(&format, 4, 1, file);
+              check += fread(&headerSize, 4, 1, file);
+              check += fread(&width, 4, 1, file);
+              check += fread(&height, 4, 1, file);
+              check += fread(&frames, 4, 1, file);
+              check += fread(&format, 4, 1, file);
+              if (check != 6){ 
+                  printf("Error reading header - please use funky video-format:\n");
+                  return -3;
+              }
           }
           if (token != VIDEO_HEADER || headerSize < 32)
           {

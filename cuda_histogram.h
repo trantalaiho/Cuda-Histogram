@@ -46,7 +46,7 @@ enum histogram_type {
 /*------------------------------------------------------------------------*//*!
  * \brief   Check the size of the temporary buffer needed for histogram
  *
- *  This function can be used to check the size of the temporary buffer
+ *  This function can be used to check the size of the temporary buffer7
  *  needed in \ref callHistogramKernel() so that a buffer of correct
  *  size can be passed in to the histogram call -- this way one can
  *  avoid the latency involved in GPU-memory allocations when running
@@ -133,7 +133,8 @@ callHistogramKernel(
     INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev = false,
-    cudaStream_t stream = 0, void* tmpBuffer = NULL);
+    cudaStream_t stream = 0, void* tmpBuffer = NULL,
+    bool allowMultiPass = true);
 
 
 
@@ -163,7 +164,8 @@ callHistogramKernelNDim(
     INDEXT* starts, INDEXT* ends,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev = false,
-    cudaStream_t stream = 0, void* tmpBuffer = NULL);
+    cudaStream_t stream = 0, void* tmpBuffer = NULL,
+    bool allowMultiPass = true);
 
 
 /*------------------------------------------------------------------------*//*!
@@ -190,7 +192,8 @@ callHistogramKernel2Dim(
     INDEXT y0, INDEXT y1,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
-    cudaStream_t stream, void* tmpBuffer);
+    cudaStream_t stream, void* tmpBuffer,
+    bool allowMultiPass = true);
 
 
 
@@ -3617,7 +3620,8 @@ callHistogramKernel(
     INDEXT start, INDEXT end,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
-    cudaStream_t stream, void* tmpBuffer)
+    cudaStream_t stream, void* tmpBuffer,
+    bool allowMultiPass)
 {
 
     int devId;
@@ -3645,7 +3649,7 @@ callHistogramKernel(
     {
         callHistogramKernelImpl<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, NULL, tmpBuffer, outInDev, cuda_arch);
     }
-    else if (runMultiPass(nOut, &props, cuda_arch, sizeof(OUTPUTTYPE), histotype))
+    else if (allowMultiPass && runMultiPass(nOut, &props, cuda_arch, sizeof(OUTPUTTYPE), histotype))
     {
         callHistogramKernelMultiPass<histotype, nMultires>(input, xformObj, sumfunObj, start, end, zero, out, nOut,  &props, stream, tmpBuffer, outInDev, cuda_arch);
     }
@@ -3700,7 +3704,8 @@ callHistogramKernelNDim(
     INDEXT* starts, INDEXT* ends,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
-    cudaStream_t stream, void* tmpBuffer)
+    cudaStream_t stream, void* tmpBuffer,
+    bool allowMultiPass)
 {
     wrapHistoInput<TRANSFORMFUNTYPE, nDim, INPUTTYPE, INDEXT, OUTPUTTYPE> wrapInput;
     INDEXT start = 0;
@@ -3720,7 +3725,7 @@ callHistogramKernelNDim(
     wrapInput.userIndexFun = xformObj;
     INDEXT end = start + size;
     return callHistogramKernel<histotype, nMultires>
-        (input, wrapInput, sumfunObj, start, end, zero, out, nOut, outInDev, stream, tmpBuffer);
+        (input, wrapInput, sumfunObj, start, end, zero, out, nOut, outInDev, stream, tmpBuffer, allowMultiPass);
 }
 
 template <histogram_type histotype, int nMultires,
@@ -3735,12 +3740,13 @@ callHistogramKernel2Dim(
     INDEXT y0, INDEXT y1,
     OUTPUTTYPE zero, OUTPUTTYPE* out, int nOut,
     bool outInDev,
-    cudaStream_t stream, void* tmpBuffer)
+    cudaStream_t stream, void* tmpBuffer,
+    bool allowMultiPass)
 {
     INDEXT starts[2] = { x0, y0 };
     INDEXT ends[2] = { x1, y1 };
     return callHistogramKernelNDim<histotype, nMultires, 2>
-        (input, xformObj, sumfunObj, starts, ends, zero, out, nOut, outInDev, stream, tmpBuffer);
+        (input, xformObj, sumfunObj, starts, ends, zero, out, nOut, outInDev, stream, tmpBuffer, allowMultiPass);
 
 }
 

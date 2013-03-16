@@ -20,25 +20,24 @@
  *  limitations under the License.
  *
  *
+ *  Compile with:
  *
+ *   nvcc -O4 -arch=<your_arch> -I../ test_mem_multi16.cu -o test_mem_multi16
+ * 
  *
  */
 
-#define TESTMAXIDX   512     // 16 keys / indices
-#define TEST_IS_POW2 1
-#define TEST_SIZE (25 * 1000 * 1000 )   // 25 million inputs (100 million keys)
-#define NRUNS 100          // Repeat 100 times => 10 Gigainputs in total (4 keys per entry)
+#define TESTMAXIDX   256        // default 256 keys (change this) / indices
+#define TEST_IS_POW2 1          // Note: This tells is TESTMAXIDX is power of two number
+#define TEST_SIZE (625 * 100 * 1000 )   // 62.5 million inputs -> 1000 million keys
+#define NRUNS 100               // Repeat 100 times => 100 Gigainputs in total (16 keys per entry)
 #define START_INDEX	0
 #define NSTRESS_RUNS    NRUNS
 
-#ifdef THRUST
-#define ENABLE_THRUST   1   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
-#endif
+#define ENABLE_THRUST   0   // Enable thrust-based version also (xform-sort_by_key-reduce_by_key)
+
 
 #include "cuda_histogram.h"
-/*#include <cuda_runtime_api.h>
-#include <cuda_runtime.h>
-#include <cuda.h>*/
 
 #if ENABLE_THRUST
 #include <thrust/transform_reduce.h>
@@ -61,15 +60,31 @@ struct test_xform2
   __host__ __device__
   void operator() (uint4* input, int i, int* result_index, int* results, int nresults) const {
     uint4 idata = input[i];
-#pragma unroll
+    #pragma unroll
     for (int resIdx = 0; resIdx < 4; resIdx++)
     {
         unsigned int data = ((unsigned int*)(&idata))[resIdx];
+    #if TESTMAXIDX < 256
     #if TEST_IS_POW2
-        *result_index++ = data & (TESTMAXIDX - 1);
+        *result_index++ = ((data >> 24) & 0xFF) & (TESTMAXIDX - 1);
+        *result_index++ = ((data >> 16) & 0xFF) & (TESTMAXIDX - 1);
+        *result_index++ = ((data >>  8) & 0xFF) & (TESTMAXIDX - 1);
+        *result_index++ = ((data >>  0) & 0xFF) & (TESTMAXIDX - 1);
     #else
-        *result_index++ = data % (TESTMAXIDX);
+        *result_index++ = ((data >> 24) & 0xFF) % (TESTMAXIDX);
+        *result_index++ = ((data >> 16) & 0xFF) % (TESTMAXIDX);
+        *result_index++ = ((data >>  8) & 0xFF) % (TESTMAXIDX);
+        *result_index++ = ((data >>  0) & 0xFF) % (TESTMAXIDX);
     #endif
+    #else
+        *result_index++ = ((data >> 24));
+        *result_index++ = ((data >> 16) & 0xFF);
+        *result_index++ = ((data >>  8) & 0xFF);
+        *result_index++ = ((data >>  0) & 0xFF);
+    #endif
+        *results++ = 1;
+        *results++ = 1;
+        *results++ = 1;
         *results++ = 1;
     }
   }
@@ -94,7 +109,7 @@ static void printres (int* res, int nres, const char* descr)
     printf("]\n");
 }
 
-static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int index_1, bool print, bool cpurun, bool stress, void* tmpbuf)
+static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int index_1, bool print, bool cpurun, bool stress, void* tmpBuffer)
 {
   int nIndex = TESTMAXIDX;
   int srun;
@@ -117,11 +132,11 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
       if (cpurun || stress)
         for (int i = index_0; i < index_1; i++)
         {
-          int index[4];
-          int tmp[4];
+          int index[16];
+          int tmp[16];
           transformFun(hostINPUT, i, &index[0], &tmp[0], 1);
           //index = indexFun(INPUT, i);
-          for (int tmpi = 0; tmpi < 4; tmpi++)
+          for (int tmpi = 0; tmpi < 16; tmpi++)
               cpures[index[tmpi]] = sumFun(cpures[index[tmpi]], tmp[tmpi]);
           //printf("i = %d,  out_index = %d,  out_val = (%.3f, %.3f) \n",i, index, tmp.real, tmp.imag);
         }
@@ -132,7 +147,7 @@ static void testHistogramParam(uint4* INPUT, uint4* hostINPUT, int index_0, int 
     }
 
     if (!cpurun)
-      callHistogramKernel<histogram_atomic_inc, 4>(INPUT, transformFun, /*indexFun,*/ sumFun, index_0, index_1, zero, tmpres, nIndex, false, 0, tmpbuf);
+      callHistogramKernel<histogram_atomic_inc, 16>(INPUT, transformFun, /*indexFun,*/ sumFun, index_0, index_1, zero, tmpres, nIndex, false, 0, tmpBuffer);
     if (stress)
     {
         int k;
@@ -335,13 +350,14 @@ static void fillInput(int* input, bool load, bool rnd)
   }
   for (i = 0; i < TEST_SIZE * 4;)
   {
-    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
-    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
-    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
-    *input++ = getInput(i++, texData, dataSize, rnd) % TESTMAXIDX;
+    *input++ = getInput(i++, texData, dataSize, rnd);
+    *input++ = getInput(i++, texData, dataSize, rnd);
+    *input++ = getInput(i++, texData, dataSize, rnd);
+    *input++ = getInput(i++, texData, dataSize, rnd);
   }
   if (texData) free(texData);
 }
+
 
 
 int main (int argc, char** argv)
@@ -359,8 +375,6 @@ int main (int argc, char** argv)
 //  bool sharp = false;
   bool rnd = false;
   bool load = false;
-
-  void* tmpbuf = NULL;
 
   printUsage();
 
@@ -394,9 +408,12 @@ int main (int argc, char** argv)
       cudaMalloc(&INPUT, 4 * sizeof(int) * TEST_SIZE);
       assert(INPUT);
       cudaMemcpy(INPUT, hostINPUT, 4 * sizeof(int) * TEST_SIZE, cudaMemcpyHostToDevice);
-      int tmpbufSize = getHistogramBufSize<histogram_atomic_inc>(0, TESTMAXIDX);
-      cudaMalloc(&tmpbuf, tmpbufSize);
     }
+    void* tmpBuffer = NULL;
+    int zero = 0;
+    int tmpbufsize = getHistogramBufSize<histogram_atomic_inc>(zero , (int)TESTMAXIDX);
+    cudaMalloc(&tmpBuffer, tmpbufsize);
+
     // Create events for timing:
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -410,7 +427,7 @@ int main (int argc, char** argv)
       if (thrust)
       {
         #if ENABLE_THRUST
-          testHistogramParamThrust(INPUT, index_0, 4*index_1, print);
+          testHistogramParamThrust(INPUT, index_0, index_1, print);
         #else
           printf("\nTest was compiled without thrust support! Find 'ENABLE_THRUST' in source-code!\n\n Exiting...\n");
           break;
@@ -418,7 +435,7 @@ int main (int argc, char** argv)
       }
       else
       {
-        testHistogramParam((uint4*)INPUT, (uint4*)hostINPUT, index_0, index_1, print, cpu, stress, tmpbuf);
+        testHistogramParam((uint4*)INPUT, (uint4*)hostINPUT, index_0, index_1, print, cpu, stress, tmpBuffer);
       }
       print = false;
       // Run only once all stress-tests
@@ -430,12 +447,12 @@ int main (int argc, char** argv)
         cudaThreadSynchronize();
         cudaEventElapsedTime(&t_ms, start, stop);
         double t = t_ms * 0.001f;
-        double GKps = (((double)TEST_SIZE * (double)NRUNS * 4.0)) / (t*1.e9);
+        double GKps = (((double)TEST_SIZE * (double)NRUNS * 16.0)) / (t*1.e9);
         printf("Runtime in loops: %fs, Throughput (Gkeys/s): %3f GK/s \n", t, GKps);
     }
-    if (tmpbuf) cudaFree(tmpbuf);
     if (INPUT) cudaFree(INPUT);
     if (hostINPUT) free(hostINPUT);
+    if (tmpBuffer) cudaFree(tmpBuffer);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
   }

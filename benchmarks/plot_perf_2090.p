@@ -1,0 +1,91 @@
+#This file draws all our results to separate html-files
+
+# First set our output to draw to a canvas element:
+
+# 1 for png, 2 for eps, 3 for html canvas element
+term = 1
+#term = 2
+#term = 3 # Note - this would seem to require gnuplot 4.4 or later
+
+
+if (term == 1) set terminal png enhanced size 1024,600
+if (term == 2) set terminal postscript eps enhanced color 
+if (term == 3) set terminal canvas enhanced size 1024,600
+
+
+if (term == 1) set output 'perf_rnd_2090.png'
+if (term == 2) set output 'perf_rnd_2090.eps'
+if (term == 3) set output 'perf_rnd_2090.html'
+
+# Plot the random data results
+
+set autoscale       # Scale plot automatically
+unset log
+set logscale x 2
+set xrange [32:132000]
+unset label
+set xtic auto
+set ytic auto
+set pointsize 1.5
+set title "Histogram Performance for uniform random keys \n Tested on Tesla M2090 (ECC enabled) - CUDA 4.0.17"
+set xlabel "Number of bins"
+set ylabel "Throughput (Gigakeys/s and Gigabytes/s)"
+set y2label "Runtime(s) - 100 runs with 1 Gigabyte input data"
+plot  \
+    "perfres_rnd_2090.csv" using 1:3 title "Throughput (GK/s)" with linespoints pointtype 4,   \
+    "perfres_rnd_2090.csv" using 1:4 title "Throughput (GB/s)" with linespoints pointtype 2,   \
+    "perfres_rnd_2090.csv" using 1:2 title "Runtime(s)" with linespoints pointtype  1          \
+
+
+if (term == 1) set output 'perf_degen_2090.png'
+if (term == 2) set output 'perf_degen_2090.eps'
+if (term == 3) set output 'perf_degen_2090.html'
+
+
+# Plot the degenerate data results
+
+set autoscale       # Scale plot automatically
+unset log
+set logscale x 2
+set xrange [32:132000]
+unset label
+set xtic auto
+set ytic auto
+set pointsize 1.5
+set title "Histogram Performance for nearly degenerate keys \n Tested on Tesla M2090 (ECC enabled) - CUDA 4.0.17"
+set xlabel "Number of bins"
+set ylabel "Throughput (Gigakeys/s and Gigabytes/s)"
+set y2label "Runtime(s) - 100 runs with 1 Gigabyte input data"
+plot  \
+    "perfres_degen_2090.csv" using 1:3 title "Throughput (GK/s)" with linespoints pointtype 4,   \
+    "perfres_degen_2090.csv" using 1:4 title "Throughput (GB/s)" with linespoints pointtype 2,   \
+    "perfres_degen_2090.csv" using 1:2 title "Runtime(s)" with linespoints pointtype  1          \
+
+
+
+if (term == 1) set output 'perf_load_2090.png'
+if (term == 2) set output 'perf_load_2090.eps'
+if (term == 3) set output 'perf_load_2090.html'
+
+
+# Plot the image data results
+
+set autoscale       # Scale plot automatically
+unset log
+set logscale x 2
+set xrange [32:132000]
+unset label
+set xtic auto
+set ytic auto
+set pointsize 1.5
+set title "Histogram Performance for texture-data keys \n Tested on Tesla M2090 (ECC enabled) - CUDA 4.0.17"
+set xlabel "Number of bins"
+set ylabel "Throughput (Gigakeys/s and Gigabytes/s)"
+set y2label "Runtime(s) - 100 runs with 1 Gigabyte input data"
+plot  \
+    "perfres_load_2090.csv" using 1:3 title "Throughput (GK/s)" with linespoints pointtype 4,   \
+    "perfres_load_2090.csv" using 1:4 title "Throughput (GB/s)" with linespoints pointtype 2,   \
+    "perfres_load_2090.csv" using 1:2 title "Runtime(s)" with linespoints pointtype  1          \
+
+
+

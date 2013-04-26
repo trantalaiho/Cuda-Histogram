@@ -43,9 +43,9 @@ the rest.
 Features
 ========
 
- - Fast normal histograms, up to 1024 bins (Optimized for Fermi, runs with all
+ - Fast normal histograms, up to 2560 bins (Optimized for Fermi, runs with all
     CUDA-cards)
- - Support for practically all histogram sizes: Tested up to 16384 bins
+ - Support for practically all histogram sizes: Tested up to 131072 bins
  - Support for arbitrary bin-types:
     * Want to add together complex numbers, or find the pixels with most red
         color in each bin? No problem: you write the function-object that sums
@@ -146,14 +146,89 @@ Minimal test example
         return 0;
     }
 
+A Very Short Description of the Algorithms Used
+===============================================
+
+ - Histograms with a small number of bins:
+    * Have a private histogram for each thread and accumulate
+    * Gets you to about 64 bins of 32-bit data and to 256 bins of 8-bit
+      normal histograms -- implementation follows 
+      [Cedric Nugteren, Gert-Jan van den Braak, Henk Corporaal, and Bart Mesman. 2011. 
+       High performance predictable histogramming on GPUs: 
+           exploring and evaluating algorithm trade-offs. 
+       In Proceedings of the Fourth Workshop on General Purpose Processing on Graphics 
+       Processing Units (GPGPU-4). ACM, New York, NY, USA, , 
+      Article 1 , 8 pages. DOI=10.1145/1964179.1964181 http://doi.acm.org/10.1145/1964179.1964181]
+      Except that our implementation uses 8-bit thread-private histograms and has to accumulate
+      to a threadblock-wide histogram every 255 steps.
+    * Complexity is `O(n_in / n_p)`, where `n_in` is the number of inputs and `n_p` is the number of processors
+    * With larger amount of bins less concurrent warps can be scheduled leading to under-utilization
+      or processors, slightly hurting performance. The reason is that more shared memory is needed to satisfy
+      more concurrent warps.
+ - Histograms with a moderate amount of bins:
+    * One histogram per block in shared memory.
+    * Use an adaptive algorithm to help with collisions:
+    (Once high amount of degeneracy found (~16 degenerate keys between 32 threads))
+     * Do warp-local reduction of values in shared memory
+     * One thread (per unique key) collects the sum
+     * Write result, free of collisions
+     * Expensive for well distributed keys → only apply when high degeneracy detected
+    * Collisions with shared memory atomics cause serialization, which should result in `O(n_in * avg_coll / n_p)`
+      complexity, but this is alleviated by using the adaptive algorithm -- here `avg_coll` is the 
+      average amount of collisions per warp.
+    * The complexity of the conflict resolution part is `O(n_unique)`, where `n_unique` is the number of 
+      unique keys that the warp in question has, within its 32 keys (one key per thread) -- therefore
+      the collision resolution-algorithm (as is) is only helpful when there is little variation in the data.
+ - Large histograms:
+    * At around 2500 bins we run low on shared memory
+    * First solution: Multiple passes of the medium histogram algorithm
+        * Improved occupancy and cache help
+    * With very large histograms (~100 000 bins) too many passes:
+        * Resort to global memory atomics
+        * For generalized histograms use a per-warp hashtable in shared memory
+        * Adaptive warp-reduction for degenerate key-distributions
+        * Performance drops to about same level as thrust at around 100 000 bins
+        * CPU should be roughly twice as fast here
+        * Even as is, could be useful to use GPU:
+            * Complex key-value resolving code can amortize (relatively) slow histogram code
+        * Global atomics will be faster in Kepler:
+            * Coupled with warp-reduction, could be very competitive
+
+
+
+Performance
+===========
+
+ - For synthetic benchmark results consult the (wiki-page)[https://github.com/trantalaiho/Cuda-Histogram/wiki].
+ - Other results with comparison to previous methods include (all results run on CUDA 4.0.17, Tesla M2070 ECC On):
+ - Real Image histogram 8-bit (256-bin) grayscale histogram:
+    * Source-code available (here)[https://github.com/trantalaiho/Cuda-Histogram/blob/master/tests_histogram/test_image_8b_1C.cu]
+    * NVIDIA Performance Primitives: 8GK/s
+    * Our implementation: 18GK/s (125% Improvement)
+    * Different image sizes:
+        * 1024x1024 -- NPP: 3.56GK/s, Our: 5.7GK/s (Improvement: 60%)
+        * 2048x2048 -- NPP: 6.64GK/s, Our: 11.76GK/s (Improvement: 77%)
+        * 4096x4096 -- NPP: 7.6GK/s, Our: 16.3GK/s (Improvement: 114%)
+        * 8192x8192 -- NPP: 7.99GK/s, Our: 17.97GK/s (Improvement: 125%)
+ -  Three-channel image histogram 8-bits per channel (256-bins per channel) RGB(A) histogram:
+    * See: [https://github.com/trantalaiho/Cuda-Histogram/blob/master/tests_histogram/test_image_8b_4C.cu]
+    * NVIDIA Performance Primitives: 6GK/s
+    * Our implementation: 12GK/s (2x faster than NPP)
+ - Generalized Histogram Performance:
+    * See: [https://github.com/trantalaiho/Cuda-Histogram/blob/master/tests_histogram/test_sum_rows.cu]
+    * Test-case: Sum over every row in a fp32 matrix
+    * Thrust reduce-by-key ~ 1.8GK/s (normal reduction ~20GK/s = 80GB/s)
+    * Our algorithm 2-7 times faster than thrust, depending on form of matrix (number of bins)
+        * Matrix: 50 x 1 000 000 -- Sum Rows time: 4.73ms -> 10.58 GK/s
+        * Matrix: 500 x 100 000 -- Sum Rows time: 4.06ms -> 12.33 GK/s
+        * Matrix: 5000 x 10 000 -- Sum Rows time: 12.13ms -> 4.12 GK/s
+ 
+
+     
 
 Known Issues
 ============
 
- - This is the first release of this software, although we have run many tests
-    there are bound to be many issues on it that we are not yet aware of -
-    please file bugs on issues encountered
- - CudaStream-API largely untested
  - Medium-sized histograms (~500 bins and more) use quite a lot of
     GPU-memory -- more than necessary -- This has been partially fixed now.
  - No byte-based bin fastpaths available for normal histograms of medium size
@@ -163,6 +238,19 @@ Known Issues
  - Code could use some cleaning up (it is still quite fresh out of the oven)
  - Optimization has been concentrated on Fermi-level hardware. Older hardware
      is supported, but little work has been done to optimize for it.
+ - No optimizations for Kepler level hardware yet -- this is pending acquisition of
+    said hardware.
  - Fastest way to do medium-sized histograms (For example 4x256 bins) is to
      do multiple passes over the data with smaller number of bins (256).
-     See for example 'test_image_8b_4AC.cu'.
+     See for example 'test_image_8b_4AC.cu'. This is due to the fact that
+     each channel can be viewed as a sub-problem and in fact this problem
+     is not a 1024-bin histogram problem, but 4 256-bin histogram problems, since
+     the bin-range of each key is known beforehand to lie within one of the channels.
+ - TODO: Implement register-based threadblock-wide accumulation histograms for small normal
+   histograms, introduced in [Brown, S.; Snoeyink, J., 
+      "Modestly faster histogram computations on GPUs," 
+      Innovative Parallel Computing (InPar), 2012 , vol., no., pp.1,7, 13-14 May 2012]
+      [URL: http://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=6339589&isnumber=6339585]. 
+   The implementation at the moment is very similar to theirs, except that is uses local
+   memory for accumulation histograms, which is slower than registers, even in L1-cache.
+

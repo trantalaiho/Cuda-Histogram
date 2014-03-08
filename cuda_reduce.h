@@ -73,13 +73,15 @@ callKahanReduceKernelNDim(
 
 
 
-#define REDUCE_BLOCK_SIZE_LOG2  7
+#define REDUCE_BLOCK_SIZE_LOG2  8
 #define REDUCE_BLOCK_SIZE       (1 << REDUCE_BLOCK_SIZE_LOG2)
 #define MAX_reduce_STEPS        2048
 #define R_ERROR_CHECKS          0
 
 #define REDUCE_UNROLL_LOG2      1
 #define REDUCE_UNROLL           (1 << REDUCE_UNROLL_LOG2)
+#define RKAHAN_UNROLL_LOG2      1
+#define RKAHAN_UNROLL           (1 << RKAHAN_UNROLL_LOG2)
 
 #if R_ERROR_CHECKS
 #include <stdio.h>
@@ -87,7 +89,7 @@ callKahanReduceKernelNDim(
 
 
 
-#define FINAL_SUM_BLOCK_SIZE    64
+#define FINAL_SUM_BLOCK_SIZE    32
 
 
 template <typename SUMFUNTYPE, typename OUTPUTTYPE>
@@ -119,8 +121,10 @@ void finalSumKernel(SUMFUNTYPE sumfunObj, OUTPUTTYPE* blockOut, int maxblocks)
         __shared__ OUTPUTTYPE shRes[64];
         shRes[threadIdx.x] = res;
         __syncthreads();
+#if (FINAL_SUM_BLOCK_SIZE >= 64)
         if (threadIdx.x < 32 && (threadIdx.x + 32) <= maxblocks) shRes[threadIdx.x] = sumfunObj(shRes[threadIdx.x + 32], shRes[threadIdx.x]);
         __threadfence_block();
+#endif
         if (threadIdx.x < 16) shRes[threadIdx.x] = sumfunObj(shRes[threadIdx.x + 16], shRes[threadIdx.x]);
         __threadfence_block();
         if (threadIdx.x < 8) shRes[threadIdx.x] = sumfunObj(shRes[threadIdx.x + 8], shRes[threadIdx.x]);
@@ -244,25 +248,34 @@ void histoKernel_reduce(
         }
         else
         {
-          // Example REDUCE_BLOCK_SIZE == 256
-          int limit = REDUCE_BLOCK_SIZE >> 1;     // Limit = 128
-          if (threadIdx.x < limit)                // For all i < 128 Add a[i] <- a[i] + a[i+128]
-              allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + limit]);
-          else
+          int limit = REDUCE_BLOCK_SIZE >> 1;
+          if (threadIdx.x >= limit)
               return; // Note - exited warps can't hang execution
-          limit >>= 1;                            // Limit = 64
-          int looplimit = ((REDUCE_BLOCK_SIZE_LOG2 - 2)); // Looplimit = 6
-  #pragma unroll
-          for (int loop = 5; loop < looplimit; loop++){   // Two iterations of loop
-              __syncthreads();                            // 1: For all i add a[i] <-  a[i] + a[i + 64], then i+32
-              allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + limit]);
-              limit >>= 1;                                // Limit = 32 -> limit = 16
-          }
+#if (REDUCE_BLOCK_SIZE == 1024)
+          allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 512]);
+         if (threadIdx.x >= 256) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 512)
+          allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 256]);
+          if (threadIdx.x >= 128) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 256)
+          __syncthreads();
+          allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 128]);
+          if (threadIdx.x >= 64) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 128)
+          allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 64]);
+#endif
           if (threadIdx.x >= 32) return;
           __syncthreads();
-          // Unroll rest manually
+#if (REDUCE_BLOCK_SIZE >= 64)
           allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 32]);
           __threadfence_block();
+#endif
           allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 16]);
           __threadfence_block();
           allbins[threadIdx.x] = sumfunObj(allbins[threadIdx.x], allbins[threadIdx.x + 8]);
@@ -310,9 +323,9 @@ void callReduceImpl(
     //int maxblocks = 16;
 
 
-    if (size > 2*1024*1024 && multiReduce < 2){
+    /*if (size > 2*1024*1024 && multiReduce < 2){
         maxblocks *= 2;
-    }
+    }*/
 
     if ((maxblocks << REDUCE_BLOCK_SIZE_LOG2) >= size){
       maxblocks = size >> REDUCE_BLOCK_SIZE_LOG2;
@@ -474,7 +487,8 @@ void kahanKernel_reduceStep(
     else
     {
       // NOTE: We need the if (1) here to get loop unrolling out of the compiler (at least nvcc 3.2.16)
-      if (1){
+      if (1)
+      {
         OUTPUTTYPE y = minusFun(xformObj(input, myStart, blockIdx.y), *c);
         OUTPUTTYPE t = sumfunObj(y, *myRes);
         *c = minusFun( minusFun( t, *myRes ), y);
@@ -511,21 +525,22 @@ void kahanKernel_reduce(
     INDEXT myStart = start + (INDEXT)((blockIdx.x) << REDUCE_BLOCK_SIZE_LOG2) + (INDEXT)threadIdx.x;
     // Run loops - unroll 8 steps manually
     if (nSteps > 0){
-      int doNSteps = (nSteps) >> REDUCE_UNROLL_LOG2;
+      int doNSteps = (nSteps) >> RKAHAN_UNROLL_LOG2;
       if (lastSteps){
-          while (myStart + (doNSteps * stride << REDUCE_UNROLL_LOG2) >= end){
+          while (myStart + (doNSteps * stride << RKAHAN_UNROLL_LOG2) >= end){
               doNSteps--;
           }
       }
       for (int step = 0; step < doNSteps; step++)
       {
           #pragma unroll
-          for (int substep = 0; substep < REDUCE_UNROLL; substep++){
+          for (int substep = 0; substep < RKAHAN_UNROLL; substep++)
+          {
             kahanKernel_reduceStep<false>(input, xformObj, sumfunObj, myStart, end, &myres, &c, minusFunObj);
             myStart += stride;
           }
       }
-      int nStepsLeft = (nSteps) - (doNSteps << REDUCE_UNROLL_LOG2);
+      int nStepsLeft = (nSteps) - (doNSteps << RKAHAN_UNROLL_LOG2);
       for (int step = 0; step < nStepsLeft; step++)
       {
           kahanKernel_reduceStep<lastSteps>(input, xformObj, sumfunObj, myStart, end, &myres, &c, minusFunObj);
@@ -540,24 +555,81 @@ void kahanKernel_reduce(
             result = ourOut[0];
 
         allbins[threadIdx.x] = myres;
+        allbins[threadIdx.x + REDUCE_BLOCK_SIZE] = c;
         // In the end combine results:
         #if REDUCE_BLOCK_SIZE > 32
         __syncthreads();
         #endif
 
-        // Safepath for last steps
-        if (threadIdx.x == 0){
-          INDEXT limit = end - (start + (INDEXT)((blockIdx.x) << REDUCE_BLOCK_SIZE_LOG2));
-          if (limit > REDUCE_BLOCK_SIZE) limit = REDUCE_BLOCK_SIZE;
-          //if (limit == 2) myres = sumfunObj(myres, myres);
-          for (int tid = 1; tid < limit; tid++){
-            OUTPUTTYPE y = minusFunObj(allbins[tid], c);
-            OUTPUTTYPE t = sumfunObj(y, myres);
-            c = minusFunObj( minusFunObj( t, myres ), y);
-            myres = t;
-            //myres = sumfunObj(allbins[tid], myres);
+#define DO_KAHAN_SUM(IDX1, IDX2) do \
+        {                                                                                                          \
+            int i1 = (IDX1); int i2 = (IDX2);                                                                      \
+            OUTPUTTYPE csum = sumfunObj(allbins[i1 + REDUCE_BLOCK_SIZE], allbins[i2 + REDUCE_BLOCK_SIZE]);         \
+            OUTPUTTYPE y = minusFunObj(allbins[i2], csum);                                                         \
+            OUTPUTTYPE t = sumfunObj(y, allbins[(i1)]);                                                            \
+            allbins[i1 + REDUCE_BLOCK_SIZE] = minusFunObj( minusFunObj( t, allbins[i1] ), y);                      \
+            allbins[i1] = t;                                                                                       \
+        } while(0)
+  
+
+        if (lastSteps && start + (INDEXT)((blockIdx.x + 1) << REDUCE_BLOCK_SIZE_LOG2) >= end)
+        {
+          // Safepath for last steps
+          if (threadIdx.x == 0){
+            INDEXT limit = end - (start + (INDEXT)((blockIdx.x) << REDUCE_BLOCK_SIZE_LOG2));
+            // TODO: Compensate errors
+            for (int tid = 1; tid < limit; tid++){
+              OUTPUTTYPE csum = sumfunObj(c, allbins[tid+REDUCE_BLOCK_SIZE]);
+              OUTPUTTYPE y = minusFunObj(allbins[tid], csum);
+              OUTPUTTYPE t = sumfunObj(y, myres);
+              c = minusFunObj( minusFunObj( t, myres ), y);
+              myres = t;
+              //myres = sumfunObj(allbins[tid], myres);
+            }
           }
         }
+        else
+        {
+          int limit = REDUCE_BLOCK_SIZE >> 1;
+          if (threadIdx.x >= limit)
+              return; // Note - exited warps can't hang execution
+#if (REDUCE_BLOCK_SIZE == 1024)
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 512);
+          if (threadIdx.x >= 256) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 512)
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 256);
+          if (threadIdx.x >= 128) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 256)
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 128);
+          if (threadIdx.x >= 64) return;
+          __syncthreads();
+#endif
+#if (REDUCE_BLOCK_SIZE >= 128)
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 64);
+#endif
+          if (threadIdx.x >= 32) return;
+          __syncthreads();
+#if (REDUCE_BLOCK_SIZE >= 64)
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 32);
+          __threadfence_block();
+#endif
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 16);
+          __threadfence_block();
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 8);
+          __threadfence_block();
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 4);
+          __threadfence_block();
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 2);
+          __threadfence_block();
+          DO_KAHAN_SUM(threadIdx.x, threadIdx.x + 1);
+          myres = allbins[threadIdx.x];
+        }
+
+        
         if (threadIdx.x == 0){
           if (first){
             result = myres;
@@ -595,14 +667,14 @@ void callKahanReduceImpl(
         return;
     }
 
-    int maxblocks = 32;
+    int maxblocks = 64;
     if (props) maxblocks = props->multiProcessorCount * 4;
     //int maxblocks = 16;
 
 
-    if (size > 2*1024*1024 && multidim < 2){
+    /*if (size > 2*1024*1024 && multidim < 2){
         maxblocks *= 2;
-    }
+    }*/
 
     if ((maxblocks << REDUCE_BLOCK_SIZE_LOG2) >= size){
       maxblocks = size >> REDUCE_BLOCK_SIZE_LOG2;
@@ -622,7 +694,7 @@ void callKahanReduceImpl(
     int sharedNeeded;
     {
         int typesize = sizeof(OUTPUTTYPE);
-        sharedNeeded = (typesize) << (REDUCE_BLOCK_SIZE_LOG2);
+        sharedNeeded = (2 * typesize) << (REDUCE_BLOCK_SIZE_LOG2);
         //printf("reduce-bin, generic, Shared needed = %d\n", sharedNeeded);
     }
     // Determine number of local variables
@@ -657,7 +729,7 @@ void callKahanReduceImpl(
         if (nSteps * (maxblocks << REDUCE_BLOCK_SIZE_LOG2) < size) nSteps++;
         if (nSteps > 0)
         {
-          kahanKernel_reduce<true><<<grid, block, sharedNeeded, stream>>>(
+            kahanKernel_reduce<true><<<grid, block, sharedNeeded, stream>>>(
                 input, xformObj, sumfunObj, start, end, tmpOut,  maxblocks, nSteps, first, minusFunObj, zero);
             start += nSteps * maxblocks * REDUCE_BLOCK_SIZE;
             first = false;
